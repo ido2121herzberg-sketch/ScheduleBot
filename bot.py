@@ -6,9 +6,10 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 # Configuration
-TELEGRAM_TOKEN = "8747693896:AAEPQKZv-GIkyAGnxgrAX8QK4pRSujs3xeY"
-NOTION_TOKEN = "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"
-ANTHROPIC_API_KEY = "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"
+import os
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 RECURRING_TASKS_DB = "367464c26f0980bfa319c778167a19a3"
 TASK_INBOX_DB = "367464c26f0980ed89b0ca6831f4b27e"
 
