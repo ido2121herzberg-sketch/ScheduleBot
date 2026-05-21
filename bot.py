@@ -104,7 +104,7 @@ def ask_claude(energy_state, time_info, inbox_tasks, recurring_tasks):
 
     message = claude.messages.create(
         model="claude-haiku-4-5",
-        max_tokens=300,
+        max_tokens=500,
         messages=[{"role": "user", "content": prompt}]
     )
     return message.content[0].text
