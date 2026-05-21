@@ -7,6 +7,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 # Configuration
 import os
+import pytz
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -18,7 +19,8 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 ENERGY_CHECK = 1
 
 def get_current_time_info():
-    now = datetime.now()
+    israel_tz = pytz.timezone("Asia/Jerusalem")
+now = datetime.now(israel_tz)
     days = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
     day_name = days[now.weekday()]
     return {
@@ -89,7 +91,7 @@ def ask_claude(energy_state, time_info, inbox_tasks, recurring_tasks):
     inbox_text = "\n".join([f"- {t['name']} ({t['energy']})" for t in inbox_tasks]) if inbox_tasks else "אין משימות חדשות"
     recurring_text = "\n".join([f"- {t['name']} ({t['energy']}, {t['preferred_time']})" for t in recurring_tasks[:10]])
 
-    prompt = f"""אתה עוזר אישי של עידו, מנטור מסחר ומוזיקאי בן 25 מתל אביב.
+    prompt = f"""אתה עוזר אישי של עידו, מנטור מסחר ומוזיקאי בן 25 מתל אביב. עידו מנגן בס, לא גיטרה.
 
 השעה עכשיו: {time_info['time']} ביום {time_info['day']}
 מצב אנרגיה: {energy_desc}
