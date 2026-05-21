@@ -1,13 +1,12 @@
+import os
 import anthropic
 import httpx
-import json
+import pytz
 from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 # Configuration
-import os
-import pytz
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -20,7 +19,7 @@ ENERGY_CHECK = 1
 
 def get_current_time_info():
     israel_tz = pytz.timezone("Asia/Jerusalem")
-now = datetime.now(israel_tz)
+    now = datetime.now(israel_tz)
     days = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
     day_name = days[now.weekday()]
     return {
