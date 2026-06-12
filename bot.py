@@ -17,23 +17,22 @@ NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 RECURRING_TASKS_DB = "367464c26f0980bfa319c778167a19a3"
 TASK_INBOX_DB = "367464c26f0980ed89b0ca6831f4b27e"
-
 WEEKLY_SCHEDULES_PARENT = "378464c26f098051ba48e8f539d92328"
 
-# Stronger model for the weekly schedule (the reasoning is heavy). If it errors,
-# swap to "claude-haiku-4-5" — but expect lower quality on the constraints.
+# Models: strong model for the weekly schedule + repairs, fast/cheap model for parsing input.
 SCHEDULE_MODEL = "claude-sonnet-4-6"
+PARSE_MODEL = "claude-haiku-4-5"
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 ENERGY_CHECK = 1
-SCHEDULE_EXCEPTIONS = 2  # conversation state for /schedule
+SCHEDULE_EXCEPTIONS = 2   # waiting for the user's raw exceptions text
+SCHEDULE_CONFIRM = 3      # waiting for "כן" or a correction
 
 DAY_ORDER = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"]
+SKIP_WORDS = {"אין", "-", "אין חריגים", "ללא", "כלום"}
+YES_WORDS = {"כן", "כן.", "yes", "אישור", "מאשר", "מאשרת", "✅", "כ", "אוקיי", "אוקי"}
 
-# Your weekly rules, verbatim from the Master weekly prompt. The generator uses
-# these as the fixed rules; recurring tasks + inbox tasks + your weekly
-# exceptions get injected below them at runtime.
 MASTER_RULES = """אתה עוזר אישי לניהול לוח זמנים. בנה לוח זמנים מלא לשבוע הבא לפי הכללים הבאים:
 
 **רוטינת בוקר קבועה כל יום:**
@@ -101,18 +100,16 @@ MASTER_RULES = """אתה עוזר אישי לניהול לוח זמנים. בנ�
 - 🟡 צהוב = אנרגיה נמוכה וחיובית — משימות קלות הדורשות קצת רצון
 - 🔴 אדום = אנרגיה נמוכה ושלילית — מטלות אדמין בלבד
 
-**אל תיצור התנגשויות. אל תפצל משימות שצריכות להיות רצופות. מלא את כל החלונות הפנויים במשימות החוזרות לפי אנרגיה וזמן מועדף.**"""
+**חוקי ברזל: אל תיצור התנגשויות — שני בלוקים לעולם לא חופפים באותה שעה. אל תפצל משימות שצריכות להיות רצופות. אל תשבץ שום דבר בתוך בלוק קבוע (מסחר, וולט). מלא את כל החלונות הפנויים במשימות החוזרות לפי אנרגיה וזמן מועדף.**"""
 
+
+# ===================== TIME / NOTION HELPERS =====================
 
 def get_current_time_info():
     israel_tz = pytz.timezone("Asia/Jerusalem")
     now = datetime.now(israel_tz)
     days = ["שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון"]
-    day_name = days[now.weekday()]
-    return {
-        "time": now.strftime("%H:%M"),
-        "day": day_name
-    }
+    return {"time": now.strftime("%H:%M"), "day": days[now.weekday()]}
 
 
 async def get_notion_data(database_id, filter_body=None):
@@ -132,7 +129,6 @@ async def get_notion_data(database_id, filter_body=None):
         return None
 
 
-# Generic Notion call for create / patch (used by the /schedule flow).
 async def notion_request(method, path, body=None):
     url = f"https://api.notion.com/v1/{path}"
     headers = {
@@ -149,7 +145,6 @@ async def notion_request(method, path, body=None):
         return {}
 
 
-# ---- small property readers ----
 def _title(props, key):
     arr = props.get(key, {}).get("title", [])
     return arr[0].get("text", {}).get("content", "") if arr else ""
@@ -167,12 +162,8 @@ def _rtext(props, key):
 
 
 async def get_inbox_tasks():
-    """Used by the energy-suggestion feature (name + energy only)."""
     data = await get_notion_data(TASK_INBOX_DB, {
-        "filter": {
-            "property": "סטטוס",
-            "select": {"equals": "אינבוקס"}
-        }
+        "filter": {"property": "סטטוס", "select": {"equals": "אינבוקס"}}
     })
     if not data:
         return []
@@ -180,14 +171,12 @@ async def get_inbox_tasks():
     for page in data.get("results", []):
         props = page["properties"]
         name = _title(props, "שם")
-        energy = _select(props, "אנרגיה")
         if name:
-            tasks.append({"name": name, "energy": energy})
+            tasks.append({"name": name, "energy": _select(props, "אנרגיה")})
     return tasks
 
 
 async def get_recurring_tasks():
-    """Used by the energy-suggestion feature."""
     data = await get_notion_data(RECURRING_TASKS_DB)
     if not data:
         return []
@@ -195,16 +184,16 @@ async def get_recurring_tasks():
     for page in data.get("results", []):
         props = page["properties"]
         name = _title(props, "Name") or _title(props, "שם")
-        energy = _select(props, "אנרגיה")
-        preferred_time = _rtext(props, "זמן מועדף")
         if name:
-            tasks.append({"name": name, "energy": energy, "preferred_time": preferred_time})
+            tasks.append({
+                "name": name,
+                "energy": _select(props, "אנרגיה"),
+                "preferred_time": _rtext(props, "זמן מועדף"),
+            })
     return tasks
 
 
-# ---- richer fetchers for the weekly schedule generator ----
 async def get_inbox_tasks_full():
-    """Inbox tasks WITH page ids + all scheduling-relevant fields."""
     data = await get_notion_data(TASK_INBOX_DB, {
         "filter": {"property": "סטטוס", "select": {"equals": "אינבוקס"}}
     })
@@ -250,6 +239,8 @@ async def get_recurring_tasks_full():
     return tasks
 
 
+# ===================== ENERGY SUGGESTION (existing feature) =====================
+
 def ask_claude(energy_state, time_info, inbox_tasks, recurring_tasks):
     energy_map = {
         "🟢": "ירוק - אנרגיה גבוהה וחיובית",
@@ -259,7 +250,6 @@ def ask_claude(energy_state, time_info, inbox_tasks, recurring_tasks):
     energy_desc = energy_map.get(energy_state, energy_state)
     inbox_text = "\n".join([f"- {t['name']} ({t['energy']})" for t in inbox_tasks]) if inbox_tasks else "אין משימות חדשות"
     recurring_text = "\n".join([f"- {t['name']} ({t['energy']}, {t['preferred_time']})" for t in recurring_tasks[:10]])
-
     prompt = f"""אתה עוזר אישי של עידו, מנטור מסחר ומוזיקאי בן 25 מתל אביב. עידו מנגן בס, לא גיטרה.
 
 השעה עכשיו: {time_info['time']} ביום {time_info['day']}
@@ -272,18 +262,106 @@ def ask_claude(energy_state, time_info, inbox_tasks, recurring_tasks):
 {recurring_text}
 
 תן לעידו 3-4 משימות מתאימות לעכשיו לפי האנרגיה והשעה. כתוב בעברית, קצר וישיר."""
-
     message = claude.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=500,
+        model=PARSE_MODEL, max_tokens=500,
         messages=[{"role": "user", "content": prompt}]
     )
     return message.content[0].text
 
 
-# ================= WEEKLY SCHEDULE GENERATION =================
+# ===================== INPUT PARSING (the "secretary" layer) =====================
 
-def build_schedule_prompt(recurring, inbox, exceptions):
+def _claude_json(model, prompt, max_tokens=4000):
+    """Call Claude and parse a JSON object out of the reply. Sync; run via to_thread."""
+    msg = claude.messages.create(
+        model=model, max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+    s, e = raw.find("{"), raw.rfind("}")
+    if s != -1 and e != -1:
+        raw = raw[s:e + 1]
+    return json.loads(raw)
+
+
+def parse_exceptions(text):
+    prompt = f"""אתה מנתח קלט עבור עוזר אישי. המשתמש כתב את החריגים והאירועים שלו לשבוע הקרוב.
+פרק כל אירוע לרשומה מובנית. החזר אך ורק JSON בפורמט הזה:
+{{"events":[{{"name":"שם האירוע","days":["שלישי"],"time":"16:00","recurring":false,"energy":"","priority":"","duration_min":null}}]}}
+
+כללים:
+- days: רשימת ימים בעברית (ראשון..שבת). אם נאמר "כל יום" שים ["כל יום"]. אם לא צוין יום, השאר [].
+- time: שעה בפורמט HH:MM אם צוינה, אחרת "גמיש".
+- recurring: true אם זה חוזר (כל יום/כל שבוע), אחרת false.
+- energy: "🟢"/"🟡"/"🔴" רק אם המשתמש רמז לכך, אחרת "".
+- priority: "דחוף"/"רגיל" אם נרמז, אחרת "".
+- duration_min: מספר דקות אם צוין, אחרת null.
+- אל תמציא פרטים שלא נאמרו. אל תוסיף אירועים שלא הוזכרו.
+בלי טקסט נוסף, בלי הסברים, בלי markdown.
+
+הקלט של המשתמש:
+{text}"""
+    data = _claude_json(PARSE_MODEL, prompt, max_tokens=1500)
+    return data.get("events", [])
+
+
+def reparse_with_correction(events, correction):
+    prompt = f"""להלן פירוש קודם של אירועי השבוע (JSON) ותיקון שהמשתמש כתב. עדכן את הרשימה לפי התיקון.
+פירוש קודם:
+{json.dumps({"events": events}, ensure_ascii=False)}
+
+התיקון של המשתמש:
+{correction}
+
+החזר אך ורק JSON באותו פורמט {{"events":[...]}}, בלי טקסט נוסף, בלי markdown."""
+    data = _claude_json(PARSE_MODEL, prompt, max_tokens=1500)
+    return data.get("events", events)
+
+
+def build_readback(events):
+    if not events:
+        return "לא זיהיתי אירועים מיוחדים השבוע."
+    lines = ["הבנתי ככה 👇"]
+    for e in events:
+        days_list = e.get("days") or []
+        if "כל יום" in days_list:
+            days = "כל יום"
+        elif days_list:
+            days = ", ".join(days_list)
+        else:
+            days = "יום גמיש"
+        t = e.get("time") or "גמיש"
+        kind = "חוזר" if e.get("recurring") else "חד-פעמי"
+        extra = []
+        if e.get("energy"):
+            extra.append(f"אנרגיה {e['energy']}")
+        if e.get("priority"):
+            extra.append(e["priority"])
+        if e.get("duration_min"):
+            extra.append(f"{e['duration_min']} דק'")
+        suffix = (" — " + ", ".join(extra)) if extra else ""
+        lines.append(f"• {e.get('name','')}: {days}, {t}, {kind}{suffix}")
+    return "\n".join(lines)
+
+
+# ===================== SCHEDULE GENERATION + VALIDATION =====================
+
+def events_to_text(events):
+    if not events:
+        return "אין חריגים מיוחדים השבוע"
+    out = []
+    for e in events:
+        days_list = e.get("days") or []
+        days = "כל יום" if "כל יום" in days_list else (", ".join(days_list) if days_list else "גמיש")
+        out.append(
+            f"- {e.get('name','')} | ימים: {days} | שעה: {e.get('time','גמיש')} | "
+            f"{'חוזר' if e.get('recurring') else 'חד-פעמי'} | אנרגיה: {e.get('energy','') or '-'} | "
+            f"עדיפות: {e.get('priority','') or '-'} | משך: {e.get('duration_min') or '-'}"
+        )
+    return "\n".join(out)
+
+
+def build_schedule_prompt(recurring, inbox, events):
     rec_lines = []
     for t in recurring:
         days = ", ".join(t["days"]) if t["days"] else "גמיש"
@@ -302,56 +380,102 @@ def build_schedule_prompt(recurring, inbox, exceptions):
         )
     inbox_text = "\n".join(inbox_lines) if inbox_lines else "אין משימות חדשות באינבוקס"
 
-    exc = exceptions.strip() if (exceptions and exceptions.strip()) else "אין חריגים מיוחדים השבוע"
-
     return f"""{MASTER_RULES}
 
 ---
-המשימות החוזרות מהטבלה (שבץ אותן בחלונות הפנויים לפי אנרגיה, יום מועדף, זמן מועדף ותדירות):
+המשימות החוזרות מהטבלה (שבץ לפי אנרגיה, יום, זמן מועדף ותדירות):
 {rec_text}
 
 ---
-משימות חדשות מהאינבוקס שצריך לשבץ השבוע (כל אחת עם מזהה id):
+משימות חדשות מהאינבוקס לשיבוץ השבוע (כל אחת עם מזהה id):
 {inbox_text}
 
 ---
-החריגים והאירועים החד-פעמיים של השבוע הזה:
-{exc}
+החריגים והאירועים החד-פעמיים של השבוע (כבר מנותחים ומאושרים על ידי המשתמש — שבץ אותם בדיוק לפי היום והשעה שצוינו):
+{events_to_text(events)}
 
 ---
-החזר אך ורק JSON תקין. בלי טקסט נוסף, בלי הסברים, בלי markdown, בלי backticks.
-מבנה מדויק:
+החזר אך ורק JSON תקין. בלי טקסט נוסף, בלי markdown, בלי backticks. מבנה מדויק:
 {{
   "schedule": [
     {{"day": "ראשון", "blocks": [
         {{"start": "07:30", "end": "08:00", "name": "שם הבלוק", "energy": "🟢", "type": "קבוע"}}
     ]}}
   ],
-  "scheduled_inbox_ids": ["<ה-id של כל משימת אינבוקס ששובצה בפועל>"]
+  "scheduled_inbox_ids": ["<id של כל משימת אינבוקס ששובצה בפועל>"]
 }}
 
 כלול את כל שבעת הימים לפי הסדר: ראשון, שני, שלישי, רביעי, חמישי, שישי, שבת.
-ב-scheduled_inbox_ids כלול אך ורק את ה-id-ים של משימות האינבוקס ששיבצת בפועל בלוח, בדיוק כפי שקיבלת אותם."""
+ב-scheduled_inbox_ids כלול אך ורק את ה-id-ים של משימות האינבוקס ששיבצת בפועל, בדיוק כפי שקיבלת."""
 
 
 def generate_schedule_json(prompt):
-    """Synchronous Claude call -> parsed dict. Run via asyncio.to_thread."""
-    message = claude.messages.create(
-        model=SCHEDULE_MODEL,
-        max_tokens=8000,
+    msg = claude.messages.create(
+        model=SCHEDULE_MODEL, max_tokens=8000,
         messages=[{"role": "user", "content": prompt}]
     )
-    raw = message.content[0].text.strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    # Slice to the JSON object in case of stray text.
-    start, end = raw.find("{"), raw.rfind("}")
-    if start != -1 and end != -1:
-        raw = raw[start:end + 1]
+    raw = msg.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+    s, e = raw.find("{"), raw.rfind("}")
+    if s != -1 and e != -1:
+        raw = raw[s:e + 1]
     return json.loads(raw)
 
 
+def _to_min(hhmm):
+    try:
+        h, m = hhmm.split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+def _to_hhmm(mins):
+    return f"{mins // 60:02d}:{mins % 60:02d}"
+
+
+def validate_schedule(schedule):
+    """Deterministic rule checks. Returns a list of violation strings (empty = clean)."""
+    violations = []
+    for day in schedule:
+        day_name = day.get("day", "")
+        parsed = []
+        for b in day.get("blocks", []):
+            st, en = _to_min(b.get("start", "")), _to_min(b.get("end", ""))
+            if st is None or en is None:
+                continue
+            parsed.append((st, en, b.get("name", "")))
+        parsed.sort()
+        for i in range(1, len(parsed)):
+            if parsed[i][0] < parsed[i - 1][1]:
+                violations.append(
+                    f"יום {day_name}: חפיפה בין '{parsed[i-1][2]}' ל-'{parsed[i][2]}' סביב {_to_hhmm(parsed[i][0])}"
+                )
+
+    # Songwriting must be 3 continuous hours (match 'כתיבת שיר' so it won't catch 'שירן').
+    for day in schedule:
+        for b in day.get("blocks", []):
+            if "כתיבת שיר" in b.get("name", ""):
+                st, en = _to_min(b.get("start", "")), _to_min(b.get("end", ""))
+                if st is not None and en is not None and (en - st) < 180:
+                    violations.append(
+                        f"יום {day.get('day','')}: 'כתיבת שירים' חייב 3 שעות רצופות (180 דק'), הופיע {en-st} דק'"
+                    )
+    return violations
+
+
+def build_repair_prompt(schedule, violations):
+    return f"""להלן לוח שבועי בפורמט JSON שיצרת:
+{json.dumps(schedule, ensure_ascii=False)}
+
+נמצאו הבעיות הבאות שחייבות תיקון:
+{chr(10).join('- ' + v for v in violations)}
+
+תקן אך ורק את הבעיות האלה. אל תשנה שום דבר אחר בלוח — אותם בלוקים, אותם זמנים, פרט למקומות שצריך לתקן.
+החזר JSON מלא ותקין באותו מבנה בדיוק: {{"schedule":[...], "scheduled_inbox_ids":[...]}}. בלי טקסט נוסף, בלי markdown."""
+
+
+# ===================== NOTION PAGE OUTPUT =====================
+
 def schedule_to_blocks(schedule):
-    """Turn the schedule JSON into Notion block objects, ordered by day."""
     blocks = []
     by_day = {d.get("day"): d.get("blocks", []) for d in schedule}
     for day in DAY_ORDER:
@@ -363,7 +487,7 @@ def schedule_to_blocks(schedule):
             "heading_3": {"rich_text": [{"type": "text", "text": {"content": day}}]}
         })
         for b in day_blocks:
-            line = f"{b.get('start', '')}–{b.get('end', '')}  {b.get('name', '')}  {b.get('energy', '')}".strip()
+            line = f"{b.get('start','')}–{b.get('end','')}  {b.get('name','')}  {b.get('energy','')}".strip()
             blocks.append({
                 "object": "block", "type": "bulleted_list_item",
                 "bulleted_list_item": {"rich_text": [{"type": "text", "text": {"content": line}}]}
@@ -380,7 +504,6 @@ async def create_schedule_page(title, blocks):
     if not page_id:
         print(f"Page creation failed: {page}")
         return None, None
-    # Notion accepts max 100 children per call; chunk to be safe.
     for i in range(0, len(blocks), 90):
         await notion_request("PATCH", f"blocks/{page_id}/children", {"children": blocks[i:i + 90]})
     return page_id, page.get("url", "")
@@ -396,9 +519,11 @@ async def mark_scheduled(page_id):
     })
 
 
-async def generate_and_post(chat_id, context, exceptions):
-    """Shared by /schedule and the 🔄 regenerate button."""
-    # If a previous unapproved draft exists, archive it so drafts don't pile up.
+# ===================== ORCHESTRATION =====================
+
+async def generate_and_post(chat_id, context):
+    events = context.user_data.get("parsed_events", [])
+
     prev = context.user_data.get("draft_page_id")
     if prev:
         try:
@@ -409,7 +534,7 @@ async def generate_and_post(chat_id, context, exceptions):
 
     recurring = await get_recurring_tasks_full()
     inbox = await get_inbox_tasks_full()
-    prompt = build_schedule_prompt(recurring, inbox, exceptions)
+    prompt = build_schedule_prompt(recurring, inbox, events)
 
     try:
         result = await asyncio.to_thread(generate_schedule_json, prompt)
@@ -421,32 +546,47 @@ async def generate_and_post(chat_id, context, exceptions):
     schedule = result.get("schedule", [])
     ids = result.get("scheduled_inbox_ids", [])
 
+    # Silent validation + auto-repair, up to 3 passes.
+    for _ in range(3):
+        violations = validate_schedule(schedule)
+        if not violations:
+            break
+        try:
+            repaired = await asyncio.to_thread(generate_schedule_json, build_repair_prompt(schedule, violations))
+            schedule = repaired.get("schedule", schedule)
+            if repaired.get("scheduled_inbox_ids"):
+                ids = repaired.get("scheduled_inbox_ids")
+        except Exception as e:
+            print(f"repair error: {e}")
+            break
+
+    remaining = validate_schedule(schedule)
+
     israel_tz = pytz.timezone("Asia/Jerusalem")
     title = "לוז שבועי – " + datetime.now(israel_tz).strftime("%d/%m/%Y")
-    blocks = schedule_to_blocks(schedule)
-
-    page_id, url = await create_schedule_page(title, blocks)
+    page_id, url = await create_schedule_page(title, schedule_to_blocks(schedule))
     if not page_id:
         await context.bot.send_message(
             chat_id,
-            "יצירת הדף בנוטיון נכשלה. ודא ש-WEEKLY_SCHEDULES_PARENT נכון, ושחיברת את ה-integration של הבוט לדף."
+            "יצירת הדף בנוטיון נכשלה. ודא ש-WEEKLY_SCHEDULES_PARENT נכון ושה-integration של הבוט מחובר לדף."
         )
         return
 
     context.user_data["draft_page_id"] = page_id
     context.user_data["pending_inbox_ids"] = ids
-    context.user_data["exceptions"] = exceptions
+
+    msg = f"הלוח מוכן 📅\n{url}\n\nשובצו {len(ids)} משימות מהאינבוקס. לאשר?"
+    if remaining:
+        msg += "\n\n⚠️ לא הצלחתי לתקן לבד:\n" + "\n".join("• " + v for v in remaining)
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ אשר", callback_data="approve_schedule"),
         InlineKeyboardButton("🔄 צור מחדש", callback_data="regen_schedule"),
     ]])
-    await context.bot.send_message(
-        chat_id,
-        f"הלוח מוכן 📅\n{url}\n\nשובצו {len(ids)} משימות מהאינבוקס. לאשר?",
-        reply_markup=keyboard
-    )
+    await context.bot.send_message(chat_id, msg, reply_markup=keyboard)
 
+
+# ===================== SCHEDULE CONVERSATION =====================
 
 async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -458,13 +598,47 @@ async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SCHEDULE_EXCEPTIONS
 
 
-async def schedule_generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    exceptions = update.message.text or ""
-    if exceptions.strip() in ("אין", "-", "אין חריגים", " אין"):
-        exceptions = ""
-    await update.message.reply_text("רגע, בונה את הלוח... (יכול לקחת חצי דקה)")
-    await generate_and_post(update.effective_chat.id, context, exceptions)
-    return ConversationHandler.END
+async def schedule_exceptions_received(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text in SKIP_WORDS:
+        context.user_data["parsed_events"] = []
+        await update.message.reply_text("אין חריגים. בונה את הלוח... (יכול לקחת חצי דקה)")
+        await generate_and_post(update.effective_chat.id, context)
+        return ConversationHandler.END
+
+    await update.message.reply_text("רגע, מנתח את מה שכתבת...")
+    try:
+        events = await asyncio.to_thread(parse_exceptions, text)
+    except Exception as e:
+        print(f"parse error: {e}")
+        events = [{"name": text, "days": [], "time": "גמיש", "recurring": False,
+                   "energy": "", "priority": "", "duration_min": None}]
+    context.user_data["parsed_events"] = events
+    await update.message.reply_text(
+        build_readback(events) + "\n\nנכון? כתוב \"כן\" לאישור, או תקן אותי במילים שלך."
+    )
+    return SCHEDULE_CONFIRM
+
+
+async def schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text in YES_WORDS:
+        await update.message.reply_text("מעולה, בונה את הלוח... (יכול לקחת חצי דקה)")
+        await generate_and_post(update.effective_chat.id, context)
+        return ConversationHandler.END
+
+    await update.message.reply_text("רגע, מעדכן...")
+    prev = context.user_data.get("parsed_events", [])
+    try:
+        events = await asyncio.to_thread(reparse_with_correction, prev, text)
+    except Exception as e:
+        print(f"reparse error: {e}")
+        events = prev
+    context.user_data["parsed_events"] = events
+    await update.message.reply_text(
+        build_readback(events) + "\n\nנכון עכשיו? \"כן\" לאישור, או תקן שוב."
+    )
+    return SCHEDULE_CONFIRM
 
 
 async def handle_schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -479,17 +653,16 @@ async def handle_schedule_callback(update: Update, context: ContextTypes.DEFAULT
                 ok += 1
             except Exception as e:
                 print(f"mark error {pid}: {e}")
-        context.user_data["draft_page_id"] = None  # approved -> keep the page
+        context.user_data["draft_page_id"] = None
         await query.edit_message_text(
             f'אושר ✅\n{ok} משימות סומנו כ"מתוזמן" (האוטומציה תהפוך אותן ל"גמור").'
         )
     elif query.data == "regen_schedule":
         await query.edit_message_text("בונה מחדש... 🔄")
-        exceptions = context.user_data.get("exceptions", "")
-        await generate_and_post(query.message.chat_id, context, exceptions)
+        await generate_and_post(query.message.chat_id, context)
 
 
-# ================= EXISTING FEATURES =================
+# ===================== EXISTING FEATURES =====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [["🟢 אנרגיה גבוהה", "🟡 אנרגיה בינונית", "🔴 אנרגיה נמוכה"]]
@@ -509,9 +682,7 @@ async def handle_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("תבחר אנרגיה מהכפתורים 😊")
         return ENERGY_CHECK
-
     await update.message.reply_text("רגע אחד...")
-
     time_info = get_current_time_info()
     inbox_tasks = await get_inbox_tasks()
     recurring_tasks = await get_recurring_tasks()
@@ -547,7 +718,10 @@ def main():
 
     schedule_conv = ConversationHandler(
         entry_points=[CommandHandler("schedule", schedule_start)],
-        states={SCHEDULE_EXCEPTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_generate)]},
+        states={
+            SCHEDULE_EXCEPTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_exceptions_received)],
+            SCHEDULE_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_confirm)],
+        },
         fallbacks=[CommandHandler("cancel", cancel)]
     )
 
