@@ -18,89 +18,65 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 RECURRING_TASKS_DB = "367464c26f0980bfa319c778167a19a3"
 TASK_INBOX_DB = "367464c26f0980ed89b0ca6831f4b27e"
 WEEKLY_SCHEDULES_PARENT = "378464c26f098051ba48e8f539d92328"
+FIXED_BLOCKS_DB = "ca022797f1844cb79c76be05fae5e073"  # בלוקים קבועים
 
-# Models: strong model for the weekly schedule + repairs, fast/cheap model for parsing input.
 SCHEDULE_MODEL = "claude-sonnet-4-6"
 PARSE_MODEL = "claude-haiku-4-5"
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 ENERGY_CHECK = 1
-SCHEDULE_EXCEPTIONS = 2   # waiting for the user's raw exceptions text
-SCHEDULE_CONFIRM = 3      # waiting for "כן" or a correction
+SCHEDULE_EXCEPTIONS = 2
+SCHEDULE_CONFIRM = 3
 
 DAY_ORDER = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"]
 SKIP_WORDS = {"אין", "-", "אין חריגים", "ללא", "כלום"}
-YES_WORDS = {"כן", "כן.", "yes", "אישור", "מאשר", "מאשרת", "✅", "כ", "אוקיי", "אוקי"}
+YES_WORDS = {"כן", "כן.", "yes", "אישור", "מאשר", "מאשרת", "✅", "אוקיי", "אוקי"}
 
-MASTER_RULES = """אתה עוזר אישי לניהול לוח זמנים. בנה לוח זמנים מלא לשבוע הבא לפי הכללים הבאים:
+# Only the FLEXIBLE / logic rules live here now. The fixed blocks come from the
+# בלוקים קבועים database and are injected as an immutable skeleton at runtime.
+FLEXIBLE_RULES = """כללי שיבוץ למשימות הגמישות. הבלוקים הקבועים כבר נתונים לך בנפרד — שבץ סביבם בלי לגעת בהם, בלי לשנות שעות ובלי למחוק.
 
-**רוטינת בוקר קבועה כל יום:**
-- 07:30 קימה, נטילת ידיים, מים, היגיינה, התלבשות, סידור מיטה
-- 08:00-08:30 תפילת שחרית
-- 08:30-09:00 ארוחת בוקר בריאה + מדיטציה 10 דקות
+**מענה שני לתלמידים:**
+- ראשון עד חמישי 16:30-18:00.
+- ביום הסשן עם תמיר בלבד: 18:30-20:00 (בדרך חזרה) במקום 16:30.
 
-**בלוקים קבועים שלא זזים לעולם:**
-- סשן מסחר יורו שני עד שישי 09:00-11:00
-- מענה ראשון לתלמידים ראשון עד חמישי — ראשון מ11:30, שאר הימים מ11:00. משך שעה וחצי
-- מענה שני לתלמידים ראשון עד חמישי 16:30-18:00
-- וולט רביעי וחמישי 19:00-23:00
-- וולט שבת 18:00-23:00
-- שיעור מסחר פרונטלי עם שחף — שעה אחת, חמישי 18:00-19:00 בעדיפות ראשונה, אם יש התנגשות קבע ביום אחר באותו שבוע
-- ראשון 13:00-14:00 נסיעה לאופיס ועבודה מהמשרד
+**ארוחת צהריים (חול):**
+- 12:30-13:00 בימים ראשון, שני, רביעי, חמישי, שישי.
+- ביום הסשן עם תמיר אין ארוחת צהריים קבועה.
 
-**כללי אימון גוף:**
-- 3 פעמים בשבוע
-- ראשון 09:00-11:30 כולל מקלחת
-- שאר הימים 12:00-14:00 בלבד, לא בזמן מסחר ולא בשעות עומס
+**אימון כושר:**
+- 3 פעמים בשבוע.
+- ראשון 09:00-11:30 כולל מקלחת.
+- בשאר הימים 12:00-14:00 בלבד, לא בזמן מסחר ולא בשעות עומס.
 
-**כללי סשן עם תמיר מפיק:**
-- פעם בשבוע, יום שני עד חמישי, 14:00-18:30
-- בחר את היום הכי פנוי ועם הכי פחות משימות כבדות באותו שבוע
-- ביום הסשן — יום קל בלבד לפני ואחרי
-- יציאה מהבית ב11:00 לתחבורה ציבורית למודיעין
-- מענה ראשון תוך כדי הליכה
-- אין ארוחת צהריים קבועה באותו יום
-- מענה שני בדרך חזרה 18:30-20:00
-- חדר כושר בתל אביב אחרי החזרה 20:00-22:00
+**סשן עם תמיר מפיק:**
+- פעם בשבוע, יום שני עד חמישי, 14:00-18:30. בחר את היום הכי פנוי והכי קל.
+- יציאה מהבית ב11:00 לתחבורה למודיעין; מענה ראשון תוך כדי הליכה.
+- מענה שני בדרך חזרה 18:30-20:00; חדר כושר בתל אביב 20:00-22:00.
+- ביום הזה — יום קל בלבד, בלי משימות כבדות לפני ואחרי.
 
-**כללי ארוחות:**
-- ארוחת צהריים 12:30-13:00 בימים ראשון, שני, רביעי, חמישי, שישי
-- ביום הסשן עם תמיר — אין ארוחת צהריים קבועה
+**שיעור מסחר עם שחף:**
+- שעה אחת, חמישי 18:00-19:00 בעדיפות. אם יש התנגשות — יום אחר באותו שבוע.
 
-**כללי קריאה:**
-- פעם אחת בלבד ביום, 30 דקות
-- פזר על פני כל ימות השבוע
-- לא לשבץ פעמיים באותו יום
+**כתיבת שירים:**
+- פעמיים בשבוע, 3 שעות רצופות כל פעם, בערב בלבד, בלי פיצול לעולם.
+- אם אין מספיק חלונות — פעם אחת בלבד, 3 שעות רצופות.
 
-**כללי כתיבת שירים:**
-- פעמיים בשבוע בלבד
-- 3 שעות רצופות כל פעם
-- בערב בלבד
-- אין פיצול בשום מקרה
-- אם אין מספיק חלונות — פעם אחת בלבד, 3 שעות רצופות
+**קריאה:**
+- 30 דקות, פעם אחת ביום, מפוזר על פני השבוע. לא פעמיים באותו יום.
 
-**כללי הופעת רחוב ושיעור ריקוד:**
-- מתחלפים כל שבוע — שבוע הופעת רחוב, שבוע שיעור ריקוד
-- הופעת רחוב — שישי או שבת, לא אחרי 16:00 בשישי בגלל קבלת שבת
-- שיעור ריקוד עם שירן — שישי 15:30, רמת גן, פעם בשבועיים
+**הופעת רחוב / שיעור ריקוד (מתחלפים כל שבוע):**
+- הופעת רחוב — שישי או שבת, לא אחרי 16:00 בשישי.
+- שיעור ריקוד עם שירן — שישי 15:30, רמת גן, פעם בשבועיים.
+- המשתמש מציין בחריגים מה פעיל השבוע.
 
-**שבת:**
-- 08:30-09:00 ארוחת בוקר + מדיטציה
-- 09:00-10:30 בישול לשבוע
-- עד 11:00 שיחת משפחה
-- עד 11:30 תכנון לוח זמנים לשבוע הבא
-- 11:30-13:00 יצירת תוכן
-- 13:00-13:30 ארוחת צהריים
-- 13:30-17:00 יצירת תוכן המשך
-- 18:00-23:00 וולט
+**אנרגיה:**
+- 🟢 גבוהה/חיובית — יצירתי ודורש ריכוז.
+- 🟡 נמוכה/חיובית — קל, דורש קצת רצון.
+- 🔴 נמוכה/שלילית — אדמין בלבד.
 
-**כללי אנרגיה:**
-- 🟢 ירוק = אנרגיה גבוהה וחיובית — משימות יצירתיות הדורשות ריכוז
-- 🟡 צהוב = אנרגיה נמוכה וחיובית — משימות קלות הדורשות קצת רצון
-- 🔴 אדום = אנרגיה נמוכה ושלילית — מטלות אדמין בלבד
-
-**חוקי ברזל: אל תיצור התנגשויות — שני בלוקים לעולם לא חופפים באותה שעה. אל תפצל משימות שצריכות להיות רצופות. אל תשבץ שום דבר בתוך בלוק קבוע (מסחר, וולט). מלא את כל החלונות הפנויים במשימות החוזרות לפי אנרגיה וזמן מועדף.**"""
+**חוקי ברזל: אסור ששני בלוקים יחפפו באותה שעה. אסור לגעת בבלוקים הקבועים או לשנות את שעותיהם. אל תפצל משימות שצריכות להיות רצופות."""
 
 
 # ===================== TIME / NOTION HELPERS =====================
@@ -239,6 +215,27 @@ async def get_recurring_tasks_full():
     return tasks
 
 
+async def get_fixed_blocks():
+    """The immutable skeleton, read from the בלוקים קבועים database."""
+    data = await get_notion_data(FIXED_BLOCKS_DB)
+    if not data:
+        return []
+    blocks = []
+    for page in data.get("results", []):
+        props = page["properties"]
+        name = _title(props, "שם")
+        if not name:
+            continue
+        blocks.append({
+            "name": name,
+            "days": _multi(props, "ימים"),
+            "start": _rtext(props, "שעת התחלה"),
+            "end": _rtext(props, "שעת סיום"),
+            "energy": _select(props, "אנרגיה"),
+        })
+    return blocks
+
+
 # ===================== ENERGY SUGGESTION (existing feature) =====================
 
 def ask_claude(energy_state, time_info, inbox_tasks, recurring_tasks):
@@ -272,7 +269,6 @@ def ask_claude(energy_state, time_info, inbox_tasks, recurring_tasks):
 # ===================== INPUT PARSING (the "secretary" layer) =====================
 
 def _claude_json(model, prompt, max_tokens=4000):
-    """Call Claude and parse a JSON object out of the reply. Sync; run via to_thread."""
     msg = claude.messages.create(
         model=model, max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}]
@@ -292,17 +288,15 @@ def parse_exceptions(text):
 כללים:
 - days: רשימת ימים בעברית (ראשון..שבת). אם נאמר "כל יום" שים ["כל יום"]. אם לא צוין יום, השאר [].
 - time: שעה בפורמט HH:MM אם צוינה, אחרת "גמיש".
-- recurring: true אם זה חוזר (כל יום/כל שבוע), אחרת false.
-- energy: "🟢"/"🟡"/"🔴" רק אם המשתמש רמז לכך, אחרת "".
-- priority: "דחוף"/"רגיל" אם נרמז, אחרת "".
+- recurring: true אם זה חוזר, אחרת false.
+- energy/priority: רק אם נרמז, אחרת "".
 - duration_min: מספר דקות אם צוין, אחרת null.
-- אל תמציא פרטים שלא נאמרו. אל תוסיף אירועים שלא הוזכרו.
-בלי טקסט נוסף, בלי הסברים, בלי markdown.
+- אל תמציא פרטים שלא נאמרו ואל תוסיף אירועים שלא הוזכרו.
+בלי טקסט נוסף, בלי markdown.
 
 הקלט של המשתמש:
 {text}"""
-    data = _claude_json(PARSE_MODEL, prompt, max_tokens=1500)
-    return data.get("events", [])
+    return _claude_json(PARSE_MODEL, prompt, max_tokens=1500).get("events", [])
 
 
 def reparse_with_correction(events, correction):
@@ -314,8 +308,7 @@ def reparse_with_correction(events, correction):
 {correction}
 
 החזר אך ורק JSON באותו פורמט {{"events":[...]}}, בלי טקסט נוסף, בלי markdown."""
-    data = _claude_json(PARSE_MODEL, prompt, max_tokens=1500)
-    return data.get("events", events)
+    return _claude_json(PARSE_MODEL, prompt, max_tokens=1500).get("events", events)
 
 
 def build_readback(events):
@@ -344,7 +337,40 @@ def build_readback(events):
     return "\n".join(lines)
 
 
-# ===================== SCHEDULE GENERATION + VALIDATION =====================
+# ===================== SCHEDULE GENERATION =====================
+
+def _to_min(hhmm):
+    try:
+        h, m = hhmm.split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+def _to_hhmm(mins):
+    return f"{mins // 60:02d}:{mins % 60:02d}"
+
+
+def skeleton_by_day(fixed_blocks):
+    by_day = {d: [] for d in DAY_ORDER}
+    for b in fixed_blocks:
+        for d in b.get("days", []):
+            if d in by_day:
+                by_day[d].append(b)
+    for d in by_day:
+        by_day[d].sort(key=lambda x: _to_min(x.get("start", "")) or 0)
+    return by_day
+
+
+def skeleton_text(by_day):
+    lines = []
+    for d in DAY_ORDER:
+        if not by_day[d]:
+            continue
+        lines.append(f"{d}:")
+        for b in by_day[d]:
+            lines.append(f"  {b['start']}–{b['end']} {b['name']} {b.get('energy','')}")
+    return "\n".join(lines) if lines else "אין בלוקים קבועים"
+
 
 def events_to_text(events):
     if not events:
@@ -361,7 +387,7 @@ def events_to_text(events):
     return "\n".join(out)
 
 
-def build_schedule_prompt(recurring, inbox, events):
+def build_schedule_prompt(fixed_by_day, recurring, inbox, events):
     rec_lines = []
     for t in recurring:
         days = ", ".join(t["days"]) if t["days"] else "גמיש"
@@ -380,22 +406,27 @@ def build_schedule_prompt(recurring, inbox, events):
         )
     inbox_text = "\n".join(inbox_lines) if inbox_lines else "אין משימות חדשות באינבוקס"
 
-    return f"""{MASTER_RULES}
+    return f"""{FLEXIBLE_RULES}
 
 ---
-המשימות החוזרות מהטבלה (שבץ לפי אנרגיה, יום, זמן מועדף ותדירות):
+בלוקים קבועים — חובה להעתיק אותם בדיוק לתוך הלוח, באותם ימים ושעות בדיוק. אסור לשנות, לקצר, לפצל או למחוק אותם:
+{skeleton_text(fixed_by_day)}
+
+---
+משימות חוזרות גמישות לשיבוץ בחלונות הפנויים (לפי אנרגיה, יום וזמן מועדף):
 {rec_text}
 
 ---
-משימות חדשות מהאינבוקס לשיבוץ השבוע (כל אחת עם מזהה id):
+משימות חדשות מהאינבוקס לשיבוץ (כל אחת עם מזהה id):
 {inbox_text}
 
 ---
-החריגים והאירועים החד-פעמיים של השבוע (כבר מנותחים ומאושרים על ידי המשתמש — שבץ אותם בדיוק לפי היום והשעה שצוינו):
+החריגים והאירועים של השבוע (מנותחים ומאושרים — שבץ בדיוק לפי היום והשעה; חובה שכולם יופיעו בלוח):
 {events_to_text(events)}
 
 ---
-החזר אך ורק JSON תקין. בלי טקסט נוסף, בלי markdown, בלי backticks. מבנה מדויק:
+בנה לוח שבועי מלא: העתק את כל הבלוקים הקבועים בדיוק, ואז מלא את שאר הזמן הפנוי במשימות הגמישות, החוזרות, האינבוקס והחריגים — בלי אף חפיפה.
+החזר אך ורק JSON תקין. בלי טקסט נוסף, בלי markdown. מבנה מדויק:
 {{
   "schedule": [
     {{"day": "ראשון", "blocks": [
@@ -404,9 +435,7 @@ def build_schedule_prompt(recurring, inbox, events):
   ],
   "scheduled_inbox_ids": ["<id של כל משימת אינבוקס ששובצה בפועל>"]
 }}
-
-כלול את כל שבעת הימים לפי הסדר: ראשון, שני, שלישי, רביעי, חמישי, שישי, שבת.
-ב-scheduled_inbox_ids כלול אך ורק את ה-id-ים של משימות האינבוקס ששיבצת בפועל, בדיוק כפי שקיבלת."""
+כלול את כל שבעת הימים לפי הסדר: ראשון, שני, שלישי, רביעי, חמישי, שישי, שבת."""
 
 
 def generate_schedule_json(prompt):
@@ -421,22 +450,12 @@ def generate_schedule_json(prompt):
     return json.loads(raw)
 
 
-def _to_min(hhmm):
-    try:
-        h, m = hhmm.split(":")
-        return int(h) * 60 + int(m)
-    except Exception:
-        return None
-
-def _to_hhmm(mins):
-    return f"{mins // 60:02d}:{mins % 60:02d}"
-
-
-def validate_schedule(schedule):
-    """Deterministic rule checks. Returns a list of violation strings (empty = clean)."""
+def validate_schedule(schedule, fixed_by_day, events):
     violations = []
+    out_by_day = {d.get("day"): d.get("blocks", []) for d in schedule}
+
+    # 1. No overlaps within a day.
     for day in schedule:
-        day_name = day.get("day", "")
         parsed = []
         for b in day.get("blocks", []):
             st, en = _to_min(b.get("start", "")), _to_min(b.get("end", ""))
@@ -447,18 +466,38 @@ def validate_schedule(schedule):
         for i in range(1, len(parsed)):
             if parsed[i][0] < parsed[i - 1][1]:
                 violations.append(
-                    f"יום {day_name}: חפיפה בין '{parsed[i-1][2]}' ל-'{parsed[i][2]}' סביב {_to_hhmm(parsed[i][0])}"
+                    f"יום {day.get('day','')}: חפיפה בין '{parsed[i-1][2]}' ל-'{parsed[i][2]}' סביב {_to_hhmm(parsed[i][0])}"
                 )
 
-    # Songwriting must be 3 continuous hours (match 'כתיבת שיר' so it won't catch 'שירן').
+    # 2. Every fixed block must appear unchanged (matched by day + exact start/end).
+    for d in DAY_ORDER:
+        for fb in fixed_by_day.get(d, []):
+            fs, fe = _to_min(fb.get("start", "")), _to_min(fb.get("end", ""))
+            found = any(
+                _to_min(b.get("start")) == fs and _to_min(b.get("end")) == fe
+                for b in out_by_day.get(d, [])
+            )
+            if not found:
+                violations.append(f"יום {d}: הבלוק הקבוע '{fb['name']}' ({fb['start']}–{fb['end']}) חסר או זז")
+
+    # 3. Songwriting = 3 continuous hours, never split ('כתיבת שיר' avoids matching 'שירן').
     for day in schedule:
         for b in day.get("blocks", []):
             if "כתיבת שיר" in b.get("name", ""):
                 st, en = _to_min(b.get("start", "")), _to_min(b.get("end", ""))
                 if st is not None and en is not None and (en - st) < 180:
                     violations.append(
-                        f"יום {day.get('day','')}: 'כתיבת שירים' חייב 3 שעות רצופות (180 דק'), הופיע {en-st} דק'"
+                        f"יום {day.get('day','')}: 'כתיבת שירים' חייב 3 שעות רצופות, הופיע {en-st} דק'"
                     )
+
+    # 4. Every confirmed event the user gave must appear somewhere.
+    if events:
+        all_names = " ".join(b.get("name", "") for d in schedule for b in d.get("blocks", []))
+        for e in events:
+            nm = (e.get("name") or "").strip()
+            words = [w for w in nm.split() if len(w) >= 3]
+            if words and not any(w in all_names for w in words):
+                violations.append(f"האירוע שביקשת '{nm}' לא שובץ בלוח")
     return violations
 
 
@@ -469,7 +508,7 @@ def build_repair_prompt(schedule, violations):
 נמצאו הבעיות הבאות שחייבות תיקון:
 {chr(10).join('- ' + v for v in violations)}
 
-תקן אך ורק את הבעיות האלה. אל תשנה שום דבר אחר בלוח — אותם בלוקים, אותם זמנים, פרט למקומות שצריך לתקן.
+תקן אך ורק את הבעיות האלה. אל תיגע בבלוקים הקבועים פרט להחזרתם למקומם, ואל תשנה שום דבר אחר.
 החזר JSON מלא ותקין באותו מבנה בדיוק: {{"schedule":[...], "scheduled_inbox_ids":[...]}}. בלי טקסט נוסף, בלי markdown."""
 
 
@@ -532,10 +571,18 @@ async def generate_and_post(chat_id, context):
             print(f"archive error: {e}")
         context.user_data["draft_page_id"] = None
 
+    fixed = await get_fixed_blocks()
+    if not fixed:
+        await context.bot.send_message(
+            chat_id,
+            "לא הצלחתי לקרוא את הבלוקים הקבועים. ודא שה-integration של הבוט מחובר לדאטהבייס 'בלוקים קבועים'."
+        )
+        return
+    fixed_by_day = skeleton_by_day(fixed)
     recurring = await get_recurring_tasks_full()
     inbox = await get_inbox_tasks_full()
-    prompt = build_schedule_prompt(recurring, inbox, events)
 
+    prompt = build_schedule_prompt(fixed_by_day, recurring, inbox, events)
     try:
         result = await asyncio.to_thread(generate_schedule_json, prompt)
     except Exception as e:
@@ -546,11 +593,9 @@ async def generate_and_post(chat_id, context):
     schedule = result.get("schedule", [])
     ids = result.get("scheduled_inbox_ids", [])
 
-    # Silent validation + auto-repair, up to 3 passes.
-    for _ in range(3):
-        violations = validate_schedule(schedule)
-        if not violations:
-            break
+    violations = validate_schedule(schedule, fixed_by_day, events)
+    if violations:
+        await context.bot.send_message(chat_id, "כמעט מוכן, מתקן כמה התנגשויות אחרונות...")
         try:
             repaired = await asyncio.to_thread(generate_schedule_json, build_repair_prompt(schedule, violations))
             schedule = repaired.get("schedule", schedule)
@@ -558,9 +603,8 @@ async def generate_and_post(chat_id, context):
                 ids = repaired.get("scheduled_inbox_ids")
         except Exception as e:
             print(f"repair error: {e}")
-            break
 
-    remaining = validate_schedule(schedule)
+    remaining = validate_schedule(schedule, fixed_by_day, events)
 
     israel_tz = pytz.timezone("Asia/Jerusalem")
     title = "לוז שבועי – " + datetime.now(israel_tz).strftime("%d/%m/%Y")
@@ -568,7 +612,7 @@ async def generate_and_post(chat_id, context):
     if not page_id:
         await context.bot.send_message(
             chat_id,
-            "יצירת הדף בנוטיון נכשלה. ודא ש-WEEKLY_SCHEDULES_PARENT נכון ושה-integration של הבוט מחובר לדף."
+            "יצירת הדף בנוטיון נכשלה. ודא ש-WEEKLY_SCHEDULES_PARENT נכון ושה-integration מחובר לדף."
         )
         return
 
