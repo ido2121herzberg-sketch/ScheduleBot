@@ -284,7 +284,8 @@ def parse_exceptions(text):
 - days: רשימת ימים בעברית (ראשון..שבת). אם נאמר "כל יום" שים ["כל יום"]. אם לא צוין יום, השאר [].
 - **קריטי — יום מפורש:** אם המשתמש ציין יום מפורש (למשל "ביום רביעי", "ברביעי", "מחר", "ביום שלישי") — קבע בדיוק את אותו יום. לעולם אל תשנה את היום, אל תנחש יום אחר, ואל תעביר ליום סמוך. טעות ביום היא הטעות החמורה ביותר.
 - time: שעה בפורמט HH:MM אם צוינה, אחרת "גמיש". עגל ל-:00 או :30. אל תשתמש לעולם ב-23:59.
-- **שם האירוע ('name') הוא הדבר עצמו** — חתונה, מסיבת יום הולדת, פגישה, שיעור. לעולם אל תיצור שם מתיאור או מאי-ודאות (למשל אל תקרא לאירוע "ערב לא ברור" או "לא בשש"). אם השעה לא ברורה — קבע time:"גמיש" ואל תכניס את אי-הודאות לשם.
+- **שם האירוע = בדיוק המילים שהמשתמש כתב, בעברית. אל תתרגם לאנגלית לעולם. אל תקצר, אל תפרש ואל תהפוך שם לתיאור.** שמות מקומות/אירועים נשמרים מילה-במילה. למשל "ערב לא ברור" הוא ערב בפאב ששמו "לא ברור" — שם האירוע הוא "ערב לא ברור" במלואו (לא "ערב", לא "unclear").
+- כל אירוע נפרד = רשומה נפרדת. לעולם אל תמזג שני אירועים לאחד, ולעולם אל תשמיט אירוע שהוזכר. שעה ששייכת לאירוע אחד לא עוברת לאירוע אחר.
 - recurring: true אם זה חוזר, אחרת false.
 - energy/priority: רק אם נרמז, אחרת "".
 - duration_min: מספר דקות אם צוין, אחרת null.
@@ -293,7 +294,7 @@ def parse_exceptions(text):
 
 הקלט של המשתמש:
 {text}"""
-    return _claude_json(PARSE_MODEL, prompt, max_tokens=1500).get("events", [])
+    return _claude_json(SCHEDULE_MODEL, prompt, max_tokens=1500).get("events", [])
 
 
 def reparse_with_correction(events, correction):
@@ -916,6 +917,7 @@ async def schedule_exceptions_received(update: Update, context: ContextTypes.DEF
         return ConversationHandler.END
 
     await update.message.reply_text("רגע, מנתח את מה שכתבת...")
+    context.user_data["exceptions_text"] = text
     try:
         events = await asyncio.to_thread(parse_exceptions, text)
     except Exception as e:
@@ -938,14 +940,21 @@ async def schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("רגע, מעדכן...")
     prev = context.user_data.get("parsed_events", [])
+    base_text = context.user_data.get("exceptions_text", "")
+    full_text = (base_text + "\n\nהבהרה/תיקון נוסף מהמשתמש: " + text).strip()
     failed = False
     try:
-        events = await asyncio.to_thread(reparse_with_correction, prev, text)
+        # Re-parse the whole intent fresh, so a correction never builds on a corrupted copy.
+        events = await asyncio.to_thread(parse_exceptions, full_text)
+        if not events:
+            events = prev
+            failed = True
     except Exception as e:
         print(f"reparse error: {e}")
         events = prev
         failed = True
 
+    context.user_data["exceptions_text"] = full_text
     context.user_data["parsed_events"] = events
 
     # Surface what actually happened instead of silently re-showing the same screen.
