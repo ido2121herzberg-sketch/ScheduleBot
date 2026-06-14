@@ -813,9 +813,292 @@ async def mark_scheduled(page_id):
     })
 
 
+# ===================== DETERMINISTIC PLACEMENT ENGINE =====================
+# The model never sets times. This code does. Priority: EVENTS > FIXED > ROUTINES.
+
+DAY_START_MIN, BEDTIME_MIN = 7 * 60 + 30, 23 * 60 + 30
+TRAVEL_BUFFER_MIN = 30
+OUT_NAMES = ["נסיעה לאופיס", "וולט", "תמיר", "שיעור ריקוד", "הרב יגאל", "כושר"]
+HOME_ONLY_NAMES = ["כתיבת שירים", "הבס", "הופעה", "יצירת תוכן", "סונו", "מהלכי ריקוד"]
+
+
+def _parse_duration_he(text):
+    if not text:
+        return None
+    table = [("חמש עשרה דקות", 15), ("שעתיים וחצי", 150), ("שלוש שעות", 180),
+             ("שעתיים", 120), ("חצי שעה", 30), ("שעה וחצי", 90), ("שעה אחת", 60), ("שעה", 60)]
+    for word, mins in table:
+        if word in text:
+            return mins
+    return None
+
+
+def _range_from(s):
+    import re
+    times = re.findall(r"(\d{1,2}):(\d{2})", s)
+    if len(times) >= 2:
+        return (int(times[0][0]) * 60 + int(times[0][1]), int(times[1][0]) * 60 + int(times[1][1]))
+    if len(times) == 1:
+        return (int(times[0][0]) * 60 + int(times[0][1]), None)
+    return None
+
+
+def _parse_window(text, day=None):
+    if not text or ("גמיש" in text and "-" not in text):
+        return (DAY_START_MIN, BEDTIME_MIN)
+    if "בראשון" in text and "/" in text:
+        sun_part, rest_part = text.split("/", 1)
+        part = sun_part if day == "ראשון" else rest_part
+        r = _range_from(part)
+        return (r[0], r[1] or BEDTIME_MIN) if r else (DAY_START_MIN, BEDTIME_MIN)
+    r = _range_from(text)
+    return (r[0], r[1] or BEDTIME_MIN) if r else (DAY_START_MIN, BEDTIME_MIN)
+
+
+def _freq_count(freq):
+    return {"שבועי": 1, "x2 בשבוע": 2, "x3 בשבוע": 3}.get(freq, 1 if freq == "יומי" else 0)
+
+
+def _is_out(name):
+    return any(k in name for k in OUT_NAMES)
+
+
+def _home_only(name):
+    return any(k in name for k in HOME_ONLY_NAMES)
+
+
+class DayPlan:
+    def __init__(self, day):
+        self.day = day
+        self.blocks = []
+
+    def occupied(self, s, e):  # spans don't count (office permits work blocks inside it)
+        for b in self.blocks:
+            if b.get("parallel") or b.get("span"):
+                continue
+            if s < b["end"] and e > b["start"]:
+                return True
+        return False
+
+    def blocked(self, s, e):  # for routines: spans block too
+        for b in self.blocks:
+            if b.get("parallel"):
+                continue
+            if s < b["end"] and e > b["start"]:
+                return True
+        return False
+
+    def out_overlap(self, s, e):
+        for b in self.blocks:
+            if b.get("out") and s < b["end"] and e > b["start"]:
+                return True
+        return False
+
+    def place(self, name, s, e, energy="", parallel=False, out=False, span=False):
+        self.blocks.append({"start": s, "end": e, "name": name, "energy": energy,
+                            "parallel": parallel, "out": out, "span": span})
+
+    def free_slot(self, win_s, win_e, dur, need_home=False):
+        edges = sorted({win_s, win_e} | {b["start"] for b in self.blocks} | {b["end"] for b in self.blocks})
+        for t in edges:
+            if t < win_s:
+                continue
+            s, e = t, t + dur
+            if e > win_e or e > BEDTIME_MIN:
+                break
+            if not self.blocked(s, e) and not (need_home and self.out_overlap(s, e)):
+                return s
+        return None
+
+    def sorted_blocks(self):
+        return sorted(self.blocks, key=lambda b: (b["start"], 1 if b.get("parallel") else 0))
+
+
+def _spread_days(name, used_days, week):
+    used = used_days.get(name, set())
+    return [d for d in week if d not in used] + [d for d in week if d in used]
+
+
+def classify_items(fixed_blocks, recurring):
+    """Split everything into FIXED (concrete day+time) and ROUTINE (flexible window)."""
+    fixed = [dict(name=f["name"], days=f.get("days", []),
+                  start=_to_min(f.get("start", "")), end=_to_min(f.get("end", "")),
+                  energy=f.get("energy", "")) for f in fixed_blocks
+             if _to_min(f.get("start", "")) is not None and _to_min(f.get("end", "")) is not None]
+
+    def covered(day, s, e):
+        return any(day in fb["days"] and fb["start"] == s and fb["end"] == e for fb in fixed)
+
+    routines = []
+    for r in recurring:
+        freq = r.get("frequency") or ""
+        if freq == "פעם בשבועיים":
+            continue  # only when the user flags it in the weekly exceptions
+        pt = r.get("preferred_time") or ""
+        rng = _range_from(pt)
+        days = [d for d in (r.get("days") or []) if d in DAY_ORDER]
+        # concrete time + specific days => it's a fixed block (dedupe against fixed DB)
+        if rng and rng[1] and days:
+            for d in days:
+                if not covered(d, rng[0], rng[1]):
+                    fixed.append(dict(name=r["name"], days=[d], start=rng[0], end=rng[1],
+                                      energy=r.get("energy", "")))
+        else:
+            routines.append(r)
+    return fixed, routines
+
+
+def build_week(fixed, recurring, events):
+    week = DAY_ORDER[:6]  # placement happens Sun–Fri; Sat is mostly its own fixed routine
+    plans = {d: DayPlan(d) for d in DAY_ORDER}
+
+    # 1. EVENTS (highest; with travel buffer; can displace fixed)
+    for ev in events:
+        dur = ev.get("duration_min") or 240
+        for day in ev.get("days", []):
+            if day not in plans:
+                continue
+            t = ev.get("time")
+            start = _to_min(t) if t and t != "גמיש" else (plans[day].free_slot(18 * 60, BEDTIME_MIN, dur) or 18 * 60)
+            end = min(start + dur, BEDTIME_MIN)
+            plans[day].place("נסיעה ל" + ev["name"], max(DAY_START_MIN, start - TRAVEL_BUFFER_MIN), start, out=True)
+            plans[day].place(ev["name"], start, end, out=True)
+
+    # 2. FIXED (office = permeable span; others exclusive; skip if event took the slot)
+    seen = set()
+    for fb in fixed:
+        s, e = fb["start"], fb["end"]
+        is_office = ("אופיס" in fb["name"]) or ("עבודה" in fb["name"])
+        for day in fb["days"]:
+            if day not in plans:
+                continue
+            key = (day, s, e, fb["name"])
+            if key in seen:
+                continue
+            seen.add(key)
+            if is_office:
+                plans[day].place(fb["name"], s, e, energy=fb.get("energy", ""), out=True, span=True)
+            elif not plans[day].occupied(s, e):
+                plans[day].place(fb["name"], s, e, energy=fb.get("energy", ""), out=_is_out(fb["name"]))
+
+    # 3. ROUTINES (flexible, distributed; durations & windows from Notion)
+    occ = []
+    for r in recurring:
+        freq = r.get("frequency") or ""
+        if freq == "יומי":
+            days = [d for d in (r.get("days") or week) if d in DAY_ORDER] or week
+            for d in days:
+                occ.append((r, d))
+        else:
+            for _ in range(_freq_count(freq)):
+                occ.append((r, None))
+    occ.sort(key=lambda x: _parse_duration_he(x[0].get("preferred_time")) or 60, reverse=True)
+
+    unplaced, used_days = [], {}
+    for r, fixed_day in occ:
+        name = r["name"]
+        need_home = _home_only(name)
+        candidates = [fixed_day] if fixed_day else _spread_days(name, used_days, week)
+        placed = False
+        for day in candidates:
+            win_s, win_e = _parse_window(r.get("preferred_time"), day)
+            dur = _parse_duration_he(r.get("preferred_time")) or (win_e - win_s)
+            slot = plans[day].free_slot(win_s, win_e, dur, need_home=need_home)
+            if slot is not None:
+                plans[day].place(name, slot, slot + dur, energy=r.get("energy", ""), out=_is_out(name))
+                used_days.setdefault(name, set()).add(day)
+                placed = True
+                break
+        if not placed:
+            unplaced.append(name)
+
+    # 4. OPEN WINDOWS (>= 60 min gaps)
+    for day, plan in plans.items():
+        cursor = DAY_START_MIN
+        gaps = []
+        for b in [x for x in plan.sorted_blocks() if not x.get("parallel")]:
+            if b["start"] - cursor >= 60:
+                gaps.append((cursor, b["start"]))
+            cursor = max(cursor, b["end"])
+        if BEDTIME_MIN - cursor >= 60:
+            gaps.append((cursor, BEDTIME_MIN))
+        for g in gaps:
+            plan.place("חלון פתוח", g[0], g[1], energy="🟡")
+
+    return plans, unplaced
+
+
+def plans_to_schedule(plans):
+    schedule = []
+    for day in DAY_ORDER:
+        blocks = []
+        for b in plans[day].sorted_blocks():
+            blocks.append({
+                "day": day, "start": _to_hhmm(b["start"]), "end": _to_hhmm(b["end"]),
+                "name": b["name"], "energy": b.get("energy", ""),
+                "type": "חלון פתוח" if b["name"] == "חלון פתוח" else "בלוק",
+                "parallel": bool(b.get("parallel")),
+            })
+        schedule.append({"day": day, "blocks": blocks})
+    return schedule
+
+
 # ===================== ORCHESTRATION =====================
 
 async def generate_and_post(chat_id, context):
+    events = context.user_data.get("parsed_events", [])
+
+    prev = context.user_data.get("draft_page_id")
+    if prev:
+        try:
+            await archive_page(prev)
+        except Exception as e:
+            print(f"archive error: {e}")
+        context.user_data["draft_page_id"] = None
+
+    fixed_raw = await get_fixed_blocks()
+    if not fixed_raw:
+        await context.bot.send_message(
+            chat_id,
+            "לא הצלחתי לקרוא את הבלוקים הקבועים. ודא שה-integration של הבוט מחובר לדאטהבייס 'בלוקים קבועים'."
+        )
+        return
+    recurring_raw = await get_recurring_tasks_full()
+
+    fixed, routines = classify_items(fixed_raw, recurring_raw)
+    plans, unplaced = build_week(fixed, routines, events)
+    schedule = plans_to_schedule(plans)
+
+    israel_tz = pytz.timezone("Asia/Jerusalem")
+    title = "לוז שבועי – " + datetime.now(israel_tz).strftime("%d/%m/%Y")
+    page_id, url = await create_schedule_page(title, schedule_to_blocks(schedule))
+    if not page_id:
+        await context.bot.send_message(
+            chat_id,
+            "יצירת הדף בנוטיון נכשלה. ודא ש-WEEKLY_SCHEDULES_PARENT נכון ושה-integration מחובר לדף."
+        )
+        return
+
+    context.user_data["draft_page_id"] = page_id
+    context.user_data["pending_inbox_ids"] = []
+
+    msg = f"הלוח מוכן 📅\n{url}\n\nאת החלונות הפתוחים תמלא לפי אנרגיה במהלך השבוע (פקודת /start)."
+    if unplaced:
+        uniq = []
+        for u in unplaced:
+            if u not in uniq:
+                uniq.append(u)
+        msg += "\n\nℹ️ לא נמצא מקום השבוע ל: " + ", ".join(uniq) + " (השבוע עמוס — אפשר לפנות זמן ידנית)."
+    msg += "\nלאשר?"
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ אשר", callback_data="approve_schedule"),
+        InlineKeyboardButton("🔄 צור מחדש", callback_data="regen_schedule"),
+    ]])
+    await context.bot.send_message(chat_id, msg, reply_markup=keyboard)
+
+
+async def _OLD_generate_and_post(chat_id, context):
     events = context.user_data.get("parsed_events", [])
 
     prev = context.user_data.get("draft_page_id")
