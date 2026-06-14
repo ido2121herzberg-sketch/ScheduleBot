@@ -982,6 +982,7 @@ def build_week(fixed, recurring, events):
                 plans[day].place(fb["name"], s, e, energy=fb.get("energy", ""), out=_is_out(fb["name"]))
 
     # 3. ROUTINES (flexible, distributed; durations & windows from Notion)
+    STRICT_NAMES = ["חדר כושר", "כתיבת שירים", "השלמת תוכן"]
     occ = []
     for r in recurring:
         freq = r.get("frequency") or ""
@@ -992,23 +993,32 @@ def build_week(fixed, recurring, events):
         else:
             for _ in range(_freq_count(freq)):
                 occ.append((r, None))
-    occ.sort(key=lambda x: _parse_duration_he(x[0].get("preferred_time")) or 60, reverse=True)
+    # strict-window items first (pickier), then longest first
+    occ.sort(key=lambda x: (0 if any(k in x[0]["name"] for k in STRICT_NAMES) else 1,
+                            -(_parse_duration_he(x[0].get("preferred_time")) or 60)))
 
     unplaced, used_days = [], {}
     for r, fixed_day in occ:
         name = r["name"]
         need_home = _home_only(name)
+        strict = any(k in name for k in STRICT_NAMES)
         candidates = [fixed_day] if fixed_day else _spread_days(name, used_days, week)
-        placed = False
-        for day in candidates:
-            win_s, win_e = _parse_window(r.get("preferred_time"), day)
-            dur = _parse_duration_he(r.get("preferred_time")) or (win_e - win_s)
-            slot = plans[day].free_slot(win_s, win_e, dur, need_home=need_home)
-            if slot is not None:
-                plans[day].place(name, slot, slot + dur, energy=r.get("energy", ""), out=_is_out(name))
-                used_days.setdefault(name, set()).add(day)
-                placed = True
-                break
+        win_s, win_e = _parse_window(r.get("preferred_time"), candidates[0] if candidates else None)
+        dur = _parse_duration_he(r.get("preferred_time")) or (win_e - win_s)
+
+        def try_place(window):
+            for day in candidates:
+                ws, we = window if window else _parse_window(r.get("preferred_time"), day)
+                slot = plans[day].free_slot(ws, we, dur, need_home=need_home)
+                if slot is not None:
+                    plans[day].place(name, slot, slot + dur, energy=r.get("energy", ""), out=_is_out(name))
+                    used_days.setdefault(name, set()).add(day)
+                    return True
+            return False
+
+        placed = try_place(None)  # preferred window first
+        if not placed and not strict:
+            placed = try_place((DAY_START_MIN, BEDTIME_MIN))  # flexible: any home time
         if not placed:
             unplaced.append(name)
 
