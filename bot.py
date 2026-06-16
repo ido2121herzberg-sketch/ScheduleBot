@@ -964,6 +964,23 @@ def build_week(fixed, recurring, events):
             plans[day].place("נסיעה ל" + ev["name"], max(DAY_START_MIN, start - TRAVEL_BUFFER_MIN), start, out=True)
             plans[day].place(ev["name"], start, end, out=True)
 
+    # ---- TAMIR DAY: special flow (leave 11:00, מענה parallel in transit, evening TLV gym) ----
+    tamir_day, tamir_fb = None, None
+    for fb in fixed:
+        if "תמיר" in fb["name"]:
+            tamir_day = fb["days"][0] if fb["days"] else None
+            tamir_fb = fb
+            break
+    if tamir_day:
+        s_start, s_end = tamir_fb["start"], tamir_fb["end"]
+        # outbound: leave home 11:00 -> session; מענה ראשון done in parallel during the ride
+        plans[tamir_day].place("נסיעה למודיעין", 11 * 60, s_start, out=True)
+        plans[tamir_day].place("מענה ראשון לתלמידים", 11 * 60, 11 * 60 + 90, parallel=True, out=True)
+        # return: מענה שני in parallel on the way back, then TLV gym (counts as a gym day)
+        plans[tamir_day].place("נסיעה חזרה ממודיעין", s_end, s_end + 90, out=True)
+        plans[tamir_day].place("מענה שני לתלמידים", s_end, s_end + 90, parallel=True, out=True)
+        plans[tamir_day].place("חדר כושר (תל אביב)", s_end + 90, s_end + 90 + 120, out=True)
+
     # 2. FIXED (office = permeable span; others exclusive; skip if event took the slot)
     seen = set()
     for fb in fixed:
@@ -971,6 +988,9 @@ def build_week(fixed, recurring, events):
         is_office = ("אופיס" in fb["name"]) or ("עבודה" in fb["name"])
         for day in fb["days"]:
             if day not in plans:
+                continue
+            # On Tamir day, מענה is handled in-transit (parallel) above — don't double-place it.
+            if day == tamir_day and ("מענה" in fb["name"]):
                 continue
             key = (day, s, e, fb["name"])
             if key in seen:
@@ -983,15 +1003,18 @@ def build_week(fixed, recurring, events):
 
     # 3. ROUTINES (flexible, distributed; durations & windows from Notion)
     STRICT_NAMES = ["חדר כושר", "כתיבת שירים", "השלמת תוכן"]
+    routine_week = [d for d in week if d != tamir_day]  # Tamir day is a light day
     occ = []
     for r in recurring:
         freq = r.get("frequency") or ""
+        # gym: the evening TLV gym on Tamir day already counts as one of the 3
+        gym_drop = 1 if (tamir_day and "חדר כושר" in r["name"]) else 0
         if freq == "יומי":
-            days = [d for d in (r.get("days") or week) if d in DAY_ORDER] or week
+            days = [d for d in (r.get("days") or routine_week) if d in DAY_ORDER and d != tamir_day] or routine_week
             for d in days:
                 occ.append((r, d))
         else:
-            for _ in range(_freq_count(freq)):
+            for _ in range(max(0, _freq_count(freq) - gym_drop)):
                 occ.append((r, None))
     # strict-window items first (pickier), then longest first
     occ.sort(key=lambda x: (0 if any(k in x[0]["name"] for k in STRICT_NAMES) else 1,
@@ -1002,7 +1025,7 @@ def build_week(fixed, recurring, events):
         name = r["name"]
         need_home = _home_only(name)
         strict = any(k in name for k in STRICT_NAMES)
-        candidates = [fixed_day] if fixed_day else _spread_days(name, used_days, week)
+        candidates = [fixed_day] if fixed_day else _spread_days(name, used_days, routine_week)
         win_s, win_e = _parse_window(r.get("preferred_time"), candidates[0] if candidates else None)
         dur = _parse_duration_he(r.get("preferred_time")) or (win_e - win_s)
 
