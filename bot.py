@@ -935,10 +935,26 @@ def classify_items(fixed_blocks, recurring):
         if freq == "פעם בשבועיים":
             continue  # only when the user flags it in the weekly exceptions
         pt = r.get("preferred_time") or ""
-        rng = _range_from(pt)
         days = [d for d in (r.get("days") or []) if d in DAY_ORDER]
+
+        # Per-day split window (e.g. "בראשון 11:30-13:00 / 11:00-12:30"): promote each
+        # day at ITS OWN time, so Sunday can differ from the other weekdays.
+        if days and "בראשון" in pt and "/" in pt:
+            dur = _parse_duration_he(pt)
+            for d in days:
+                ws, we = _parse_window(pt, d)
+                e = (ws + dur) if dur else we
+                if not covered(d, ws, e):
+                    fixed.append(dict(name=r["name"], days=[d], start=ws, end=e,
+                                      energy=r.get("energy", "")))
+            continue
+
+        # A "window + duration" spec (has משך / a duration word) is FLEXIBLE, not a
+        # fixed block — keep it as a routine instead of pinning the whole window.
+        has_duration = ("משך" in pt) or (_parse_duration_he(pt) is not None)
+        rng = _range_from(pt)
         # concrete time + specific days => it's a fixed block (dedupe against fixed DB)
-        if rng and rng[1] and days:
+        if rng and rng[1] and days and not has_duration:
             for d in days:
                 if not covered(d, rng[0], rng[1]):
                     fixed.append(dict(name=r["name"], days=[d], start=rng[0], end=rng[1],
