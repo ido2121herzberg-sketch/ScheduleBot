@@ -204,6 +204,7 @@ async def get_recurring_tasks_full():
             "energy": _select(props, "אנרגיה"),
             "frequency": _select(props, "תדירות"),
             "block_type": _select(props, "סוג בלוק"),
+            "importance": _select(props, "חשיבות"),
             "preferred_time": _rtext(props, "זמן מועדף"),
             "days": _multi(props, "יום מועדף"),
         })
@@ -919,6 +920,17 @@ def _spread_days(name, used_days, week):
     return [d for d in week if d not in used] + [d for d in week if d in used]
 
 
+def _routine_days(r, tamir_day):
+    """Explicit target days for a routine ('כל יום' -> all 7), or None if flexible.
+    Tamir day is excluded (light day); a routine that names only Tamir-day falls
+    back to flexible placement."""
+    raw = r.get("days") or []
+    if "כל יום" in raw:
+        return [d for d in DAY_ORDER if d != tamir_day]
+    specific = [d for d in raw if d in DAY_ORDER and d != tamir_day]
+    return specific or None
+
+
 def classify_items(fixed_blocks, recurring):
     """Split everything into FIXED (concrete day+time) and ROUTINE (flexible window)."""
     fixed = [dict(name=f["name"], days=f.get("days", []),
@@ -934,6 +946,8 @@ def classify_items(fixed_blocks, recurring):
         freq = r.get("frequency") or ""
         if freq == "פעם בשבועיים":
             continue  # only when the user flags it in the weekly exceptions
+        if (r.get("importance") or "") == "זמן פנוי":
+            continue  # mood pool: never auto-placed — offered by the /start energy flow
         pt = r.get("preferred_time") or ""
         days = [d for d in (r.get("days") or []) if d in DAY_ORDER]
 
@@ -1020,33 +1034,37 @@ def build_week(fixed, recurring, events):
     # 3. ROUTINES (flexible, distributed; durations & windows from Notion)
     STRICT_NAMES = ["חדר כושר", "כתיבת שירים", "השלמת תוכן"]
     routine_week = [d for d in week if d != tamir_day]  # Tamir day is a light day
-    occ = []
+    occ = []  # each entry: (routine, day_pool) — the days this occurrence may use
     for r in recurring:
         freq = r.get("frequency") or ""
         # gym: the evening TLV gym on Tamir day already counts as one of the 3
         gym_drop = 1 if (tamir_day and "חדר כושר" in r["name"]) else 0
+        target = _routine_days(r, tamir_day)  # explicit days (incl שבת), or None if flexible
         if freq == "יומי":
-            days = [d for d in (r.get("days") or routine_week) if d in DAY_ORDER and d != tamir_day] or routine_week
-            for d in days:
-                occ.append((r, d))
+            for d in (target or routine_week):
+                occ.append((r, [d]))
         else:
+            pool = target or routine_week  # weekly/x2/x3: honor named days, else spread Sun–Fri
             for _ in range(max(0, _freq_count(freq) - gym_drop)):
-                occ.append((r, None))
+                occ.append((r, pool))
     # strict-window items first (pickier), then longest first
     occ.sort(key=lambda x: (0 if any(k in x[0]["name"] for k in STRICT_NAMES) else 1,
                             -(_parse_duration_he(x[0].get("preferred_time")) or 60)))
 
     unplaced, used_days = [], {}
-    for r, fixed_day in occ:
+    for r, day_pool in occ:
         name = r["name"]
         need_home = _home_only(name)
         strict = any(k in name for k in STRICT_NAMES)
-        candidates = [fixed_day] if fixed_day else _spread_days(name, used_days, routine_week)
+        candidates = day_pool if len(day_pool) == 1 else _spread_days(name, used_days, day_pool)
         win_s, win_e = _parse_window(r.get("preferred_time"), candidates[0] if candidates else None)
         dur = _parse_duration_he(r.get("preferred_time")) or (win_e - win_s)
 
         def try_place(window):
             for day in candidates:
+                if any(b["name"] == name for b in plans[day].blocks):
+                    used_days.setdefault(name, set()).add(day)
+                    return True  # a same-named block already covers this day — satisfied
                 ws, we = window if window else _parse_window(r.get("preferred_time"), day)
                 slot = plans[day].free_slot(ws, we, dur, need_home=need_home)
                 if slot is not None:
