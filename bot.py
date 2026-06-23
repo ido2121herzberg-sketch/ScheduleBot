@@ -64,7 +64,7 @@ FLEXIBLE_RULES = """אתה בונה לוז שבועי לעידו. הנתונים
 - פעם בשבוע, שני עד חמישי. בחר את היום הקל ביותר. יום קל בלבד — בלי משימות כבדות לפני ואחרי.
 - יציאה מהבית ב-11:00. הנסיעה למודיעין = בלוק יחיד "נסיעה למודיעין".
 - 'מענה ראשון' מתבצע תוך כדי הנסיעה — "parallel": true, באותו משך כרגיל.
-- מענה שני בדרך חזרה; חדר כושר בתל אביב בערב נחשב כאחד מימי הכושר (אין כושר בוקר/צהריים באותו יום).
+- מענה שני בדרך חזרה; חדר כושר בתל אביב בערב נחשב כאחד מימי הכושר.
 
 == הופעת רחוב / שיעור ריקוד (פעם בשבועיים, מתחלפים) ==
 - פעילים רק אם המשתמש ציין בחריגים שזה השבוע. הופעת רחוב — שישי/שבת, לא אחרי 16:00 בשישי.
@@ -569,7 +569,6 @@ def validate_schedule(schedule, fixed_by_day, events, recurring=None):
                 violations.append(f"האירוע שביקשת '{nm}' לא שובץ בלוח")
 
     # 6. ANCHOR LOCK: an event with a user-given day MUST appear on that exact day.
-    #    This is what catches "told it Wednesday, it placed Friday".
     if events:
         for e in events:
             days_list = e.get("days") or []
@@ -615,7 +614,6 @@ def validate_schedule(schedule, fixed_by_day, events, recurring=None):
             nm = (t.get("name") or "").strip()
             freq = t.get("frequency") or ""
             block_type = t.get("block_type") or ""
-            # קבוע routines are fixed blocks or have their own hard rules — don't double-require here.
             if not nm or freq == "פעם בשבועיים" or block_type == "קבוע":
                 continue
             words = [w for w in nm.split() if len(w) >= 3]
@@ -724,7 +722,6 @@ def merge_open_windows(schedule):
         blocks = day.get("blocks", [])
         blocks.sort(key=lambda b: _to_min(b.get("start", "")) or 0)
 
-        # 1. Merge adjacent same-energy open windows into one.
         merged = []
         for b in blocks:
             if (is_open(b) and merged and is_open(merged[-1])
@@ -734,7 +731,6 @@ def merge_open_windows(schedule):
             else:
                 merged.append(b)
 
-        # 2. Open windows shorter than 60 min get absorbed into the shorter adjacent real block.
         result = []
         for i, b in enumerate(merged):
             if is_open(b) and 0 <= dur(b) < 60:
@@ -745,10 +741,9 @@ def merge_open_windows(schedule):
                 next_ok = (next_b is not None and not is_open(next_b)
                            and _to_min(next_b.get("start", "")) == _to_min(b.get("end", "")))
                 if prev_ok and (not next_ok or dur(prev_b) <= dur(next_b)):
-                    prev_b["end"] = b.get("end")        # extend shorter previous block into the gap
+                    prev_b["end"] = b.get("end")
                 elif next_ok:
-                    next_b["start"] = b.get("start")     # pull shorter next block back into the gap
-                # else: no real neighbor to absorb into -> drop the window
+                    next_b["start"] = b.get("start")
                 continue
             result.append(b)
         day["blocks"] = result
@@ -819,8 +814,22 @@ async def mark_scheduled(page_id):
 
 DAY_START_MIN, BEDTIME_MIN = 7 * 60 + 30, 23 * 60 + 30
 TRAVEL_BUFFER_MIN = 30
+DATED_INBOX_DEFAULT_MIN = 90  # default length for a dated inbox task with no duration in זמן מועדף
 OUT_NAMES = ["נסיעה לאופיס", "וולט", "תמיר", "שיעור ריקוד", "הרב יגאל", "כושר"]
 HOME_ONLY_NAMES = ["כתיבת שירים", "הבס", "הופעה", "יצירת תוכן", "סונו", "מהלכי ריקוד"]
+
+
+def _energy_emoji(s):
+    """Normalize any energy value (full Hebrew label or emoji) to a single emoji."""
+    if not s:
+        return ""
+    if "ירוק" in s or "🟢" in s:
+        return "🟢"
+    if "צהוב" in s or "🟡" in s:
+        return "🟡"
+    if "אדום" in s or "🔴" in s:
+        return "🔴"
+    return ""
 
 
 def _parse_duration_he(text):
@@ -832,6 +841,21 @@ def _parse_duration_he(text):
         if word in text:
             return mins
     return None
+
+
+def _split_travel(text):
+    """Separate an optional 'נסיעה: <dur>' hint from the rest of a זמן מועדף string.
+    Lets travel time live in the task data (per destination) instead of being hardcoded."""
+    if text and "נסיעה" in text:
+        main, trav = text.split("נסיעה", 1)
+        return main.rstrip(" /"), trav
+    return (text or ""), ""
+
+
+def _parse_travel_min(text):
+    """Travel-buffer minutes from a 'נסיעה: <dur>' hint in זמן מועדף, else the default."""
+    _, trav = _split_travel(text)
+    return _parse_duration_he(trav) or TRAVEL_BUFFER_MIN
 
 
 def _range_from(s):
@@ -951,8 +975,6 @@ def classify_items(fixed_blocks, recurring):
         pt = r.get("preferred_time") or ""
         days = [d for d in (r.get("days") or []) if d in DAY_ORDER]
 
-        # Per-day split window (e.g. "בראשון 11:30-13:00 / 11:00-12:30"): promote each
-        # day at ITS OWN time, so Sunday can differ from the other weekdays.
         if days and "בראשון" in pt and "/" in pt:
             dur = _parse_duration_he(pt)
             for d in days:
@@ -963,13 +985,14 @@ def classify_items(fixed_blocks, recurring):
                                       energy=r.get("energy", "")))
             continue
 
-        # A "window + duration" spec (has משך / a duration word) is FLEXIBLE, not a
-        # fixed block — keep it as a routine instead of pinning the whole window.
         has_duration = ("משך" in pt) or (_parse_duration_he(pt) is not None)
         rng = _range_from(pt)
-        # concrete time + specific days => it's a fixed block (dedupe against fixed DB)
-        if rng and rng[1] and days and not has_duration:
-            for d in days:
+        # A concrete clock range with no duration word is a fixed-time block. Specific days
+        # promote on those days; "כל יום" promotes on all 7. (Daily meals belong in the
+        # skeleton, so they win their slot instead of losing it to a flexible routine.)
+        promote_days = DAY_ORDER if "כל יום" in (r.get("days") or []) else days
+        if rng and rng[1] and promote_days and not has_duration:
+            for d in promote_days:
                 if not covered(d, rng[0], rng[1]):
                     fixed.append(dict(name=r["name"], days=[d], start=rng[0], end=rng[1],
                                       energy=r.get("energy", "")))
@@ -978,7 +1001,41 @@ def classify_items(fixed_blocks, recurring):
     return fixed, routines
 
 
-def build_week(fixed, recurring, events):
+def classify_dated_inbox(inbox_tasks):
+    """Stage 3: pick inbox tasks that carry an explicit weekday.
+    Tasks with no day (or only 'גמיש') stay out — they belong to the /start mood pool (Stage 4).
+    Returns a list of dicts ready for build_week's dated-inbox pass."""
+    dated = []
+    for t in (inbox_tasks or []):
+        days = [d for d in (t.get("days") or []) if d in DAY_ORDER]
+        if not days:
+            continue
+        dated.append({
+            "id": t.get("id"),
+            "name": t.get("name", ""),
+            "days": days,
+            "preferred_time": t.get("preferred_time") or "",
+            "energy": t.get("energy", ""),
+        })
+    return dated
+
+
+def _dated_inbox_timing(pt):
+    """Decide how a dated inbox task is timed from its זמן מועדף text.
+    Returns (pinned_start_min_or_None, duration_min). A 'נסיעה: ...' travel hint is
+    stripped first so it can't be mistaken for the task's own length.
+    - single time, no duration word  -> pinned start (e.g. '21:30')
+    - window/range or has a duration  -> not pinned; place in the window via free_slot."""
+    main = _split_travel(pt)[0]
+    has_dur = ("משך" in main) or (_parse_duration_he(main) is not None)
+    dur = _parse_duration_he(main) or DATED_INBOX_DEFAULT_MIN
+    rng = _range_from(main)
+    if rng and rng[1] is None and not has_dur:
+        return rng[0], dur          # one explicit clock time -> pin it
+    return None, dur                # window / range / duration-based -> free slot
+
+
+def build_week(fixed, recurring, events, dated_inbox=None):
     week = DAY_ORDER[:6]  # placement happens Sun–Fri; Sat is mostly its own fixed routine
     plans = {d: DayPlan(d) for d in DAY_ORDER}
 
@@ -1003,23 +1060,22 @@ def build_week(fixed, recurring, events):
             break
     if tamir_day:
         s_start, s_end = tamir_fb["start"], tamir_fb["end"]
-        # outbound: leave home 11:00 -> session; מענה ראשון done in parallel during the ride
         plans[tamir_day].place("נסיעה למודיעין", 11 * 60, s_start, out=True)
         plans[tamir_day].place("מענה ראשון לתלמידים", 11 * 60, 11 * 60 + 90, parallel=True, out=True)
-        # return: מענה שני in parallel on the way back, then TLV gym (counts as a gym day)
         plans[tamir_day].place("נסיעה חזרה ממודיעין", s_end, s_end + 90, out=True)
         plans[tamir_day].place("מענה שני לתלמידים", s_end, s_end + 90, parallel=True, out=True)
         plans[tamir_day].place("חדר כושר (תל אביב)", s_end + 90, s_end + 90 + 120, out=True)
 
     # 2. FIXED (office = permeable span; others exclusive; skip if event took the slot)
+    #    Placed earliest-start first (then longest first) so an earlier/longer commitment
+    #    anchors and a later short block yields instead of evicting it.
     seen = set()
-    for fb in fixed:
+    for fb in sorted(fixed, key=lambda b: (b["start"], -(b["end"] - b["start"]))):
         s, e = fb["start"], fb["end"]
         is_office = ("אופיס" in fb["name"]) or ("עבודה" in fb["name"])
         for day in fb["days"]:
             if day not in plans:
                 continue
-            # On Tamir day, מענה is handled in-transit (parallel) above — don't double-place it.
             if day == tamir_day and ("מענה" in fb["name"]):
                 continue
             key = (day, s, e, fb["name"])
@@ -1031,23 +1087,62 @@ def build_week(fixed, recurring, events):
             elif not plans[day].occupied(s, e):
                 plans[day].place(fb["name"], s, e, energy=fb.get("energy", ""), out=_is_out(fb["name"]))
 
+    # 2.5 DATED INBOX (Stage 3): one-time tasks with an explicit day, placed like priority-2.
+    #     Travel buffer only if the task is out-of-home (_is_out). Pinned tasks reserve their
+    #     exact time; day-only tasks take a free slot inside their window. Runs after FIXED so a
+    #     day-only task slots around the skeleton, and before ROUTINES so flexible routines yield.
+    placed_inbox_ids = []
+    for it in (dated_inbox or []):
+        name = it.get("name", "")
+        if not name:
+            continue
+        out = _is_out(name)
+        energy = _energy_emoji(it.get("energy", ""))
+        pt = it.get("preferred_time", "")
+        main = _split_travel(pt)[0]          # זמן מועדף without the travel hint
+        travel = _parse_travel_min(pt)       # per-task travel buffer (default 30)
+        pinned_start, dur = _dated_inbox_timing(pt)
+        placed_any = False
+        for day in it.get("days", []):
+            if day not in plans:
+                continue
+            if any(b["name"] == name for b in plans[day].blocks):
+                placed_any = True  # already present on this day
+                continue
+            if pinned_start is not None:
+                start = pinned_start
+                end = min(start + dur, BEDTIME_MIN)
+                if end <= start:
+                    continue
+            else:
+                ws, we = _parse_window(main, day)
+                slot = plans[day].free_slot(ws, we, dur, need_home=not out)
+                if slot is None:
+                    continue
+                start, end = slot, slot + dur
+            if out:
+                plans[day].place("נסיעה ל" + name,
+                                 max(DAY_START_MIN, start - travel), start, out=True)
+            plans[day].place(name, start, end, energy=energy, out=out)
+            placed_any = True
+        if placed_any and it.get("id"):
+            placed_inbox_ids.append(it["id"])
+
     # 3. ROUTINES (flexible, distributed; durations & windows from Notion)
     STRICT_NAMES = ["חדר כושר", "כתיבת שירים", "השלמת תוכן"]
     routine_week = [d for d in week if d != tamir_day]  # Tamir day is a light day
     occ = []  # each entry: (routine, day_pool) — the days this occurrence may use
     for r in recurring:
         freq = r.get("frequency") or ""
-        # gym: the evening TLV gym on Tamir day already counts as one of the 3
         gym_drop = 1 if (tamir_day and "חדר כושר" in r["name"]) else 0
-        target = _routine_days(r, tamir_day)  # explicit days (incl שבת), or None if flexible
+        target = _routine_days(r, tamir_day)
         if freq == "יומי":
             for d in (target or routine_week):
                 occ.append((r, [d]))
         else:
-            pool = target or routine_week  # weekly/x2/x3: honor named days, else spread Sun–Fri
+            pool = target or routine_week
             for _ in range(max(0, _freq_count(freq) - gym_drop)):
                 occ.append((r, pool))
-    # strict-window items first (pickier), then longest first
     occ.sort(key=lambda x: (0 if any(k in x[0]["name"] for k in STRICT_NAMES) else 1,
                             -(_parse_duration_he(x[0].get("preferred_time")) or 60)))
 
@@ -1064,7 +1159,7 @@ def build_week(fixed, recurring, events):
             for day in candidates:
                 if any(b["name"] == name for b in plans[day].blocks):
                     used_days.setdefault(name, set()).add(day)
-                    return True  # a same-named block already covers this day — satisfied
+                    return True
                 ws, we = window if window else _parse_window(r.get("preferred_time"), day)
                 slot = plans[day].free_slot(ws, we, dur, need_home=need_home)
                 if slot is not None:
@@ -1073,9 +1168,9 @@ def build_week(fixed, recurring, events):
                     return True
             return False
 
-        placed = try_place(None)  # preferred window first
+        placed = try_place(None)
         if not placed and not strict:
-            placed = try_place((DAY_START_MIN, BEDTIME_MIN))  # flexible: any home time
+            placed = try_place((DAY_START_MIN, BEDTIME_MIN))
         if not placed:
             unplaced.append(name)
 
@@ -1092,7 +1187,7 @@ def build_week(fixed, recurring, events):
         for g in gaps:
             plan.place("חלון פתוח", g[0], g[1], energy="🟡")
 
-    return plans, unplaced
+    return plans, unplaced, placed_inbox_ids
 
 
 def plans_to_schedule(plans):
@@ -1131,9 +1226,11 @@ async def generate_and_post(chat_id, context):
         )
         return
     recurring_raw = await get_recurring_tasks_full()
+    inbox_raw = await get_inbox_tasks_full()
+    dated_inbox = classify_dated_inbox(inbox_raw)
 
     fixed, routines = classify_items(fixed_raw, recurring_raw)
-    plans, unplaced = build_week(fixed, routines, events)
+    plans, unplaced, placed_inbox_ids = build_week(fixed, routines, events, dated_inbox=dated_inbox)
     schedule = plans_to_schedule(plans)
 
     israel_tz = pytz.timezone("Asia/Jerusalem")
@@ -1147,9 +1244,12 @@ async def generate_and_post(chat_id, context):
         return
 
     context.user_data["draft_page_id"] = page_id
-    context.user_data["pending_inbox_ids"] = []
+    context.user_data["pending_inbox_ids"] = placed_inbox_ids
 
-    msg = f"הלוח מוכן 📅\n{url}\n\nאת החלונות הפתוחים תמלא לפי אנרגיה במהלך השבוע (פקודת /start)."
+    msg = f"הלוח מוכן 📅\n{url}\n"
+    if placed_inbox_ids:
+        msg += f'\nℹ️ שובצו {len(placed_inbox_ids)} משימות אינבוקס עם יום מפורש (יסומנו כ"מתוזמן" באישור).'
+    msg += "\nאת החלונות הפתוחים תמלא לפי אנרגיה במהלך השבוע (פקודת /start)."
     if unplaced:
         uniq = []
         for u in unplaced:
@@ -1198,7 +1298,6 @@ async def _OLD_generate_and_post(chat_id, context):
     schedule = result.get("schedule", [])
     ids = result.get("scheduled_inbox_ids", [])
 
-    # Silent validation + up to 2 prescriptive repair passes.
     violations = validate_schedule(schedule, fixed_by_day, events, recurring)
     attempts = 0
     while violations and attempts < 2:
@@ -1294,7 +1393,6 @@ async def schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_text = (base_text + "\n\nהבהרה/תיקון נוסף מהמשתמש: " + text).strip()
     failed = False
     try:
-        # Re-parse the whole intent fresh, so a correction never builds on a corrupted copy.
         events = await asyncio.to_thread(parse_exceptions, full_text)
         if not events:
             events = prev
@@ -1307,7 +1405,6 @@ async def schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["exceptions_text"] = full_text
     context.user_data["parsed_events"] = events
 
-    # Surface what actually happened instead of silently re-showing the same screen.
     if failed:
         await update.message.reply_text(
             "לא הצלחתי לעבד את התיקון הזה 🤔 נסה לנסח אותו אחרת (איזה אירוע ומה לשנות), "
@@ -1342,9 +1439,12 @@ async def handle_schedule_callback(update: Update, context: ContextTypes.DEFAULT
             except Exception as e:
                 print(f"mark error {pid}: {e}")
         context.user_data["draft_page_id"] = None
-        await query.edit_message_text(
-            f'אושר ✅\n{ok} משימות סומנו כ"מתוזמן" (האוטומציה תהפוך אותן ל"גמור").'
-        )
+        if ok:
+            await query.edit_message_text(
+                f'אושר ✅\n{ok} משימות אינבוקס סומנו כ"מתוזמן".'
+            )
+        else:
+            await query.edit_message_text("אושר ✅")
     elif query.data == "regen_schedule":
         await query.edit_message_text("בונה מחדש... 🔄")
         await generate_and_post(query.message.chat_id, context)
