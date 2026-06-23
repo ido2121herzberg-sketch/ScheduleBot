@@ -815,6 +815,7 @@ async def mark_scheduled(page_id):
 DAY_START_MIN, BEDTIME_MIN = 7 * 60 + 30, 23 * 60 + 30
 TRAVEL_BUFFER_MIN = 30
 DATED_INBOX_DEFAULT_MIN = 90  # default length for a dated inbox task with no duration in זמן מועדף
+MICRO_MAX_MIN = 15  # routines shorter than this are micro-tasks: placed parallel, never their own grid slot
 OUT_NAMES = ["נסיעה לאופיס", "וולט", "תמיר", "שיעור ריקוד", "הרב יגאל", "כושר"]
 HOME_ONLY_NAMES = ["כתיבת שירים", "הבס", "הופעה", "יצירת תוכן", "סונו", "מהלכי ריקוד"]
 
@@ -836,7 +837,8 @@ def _parse_duration_he(text):
     if not text:
         return None
     table = [("חמש עשרה דקות", 15), ("שעתיים וחצי", 150), ("שלוש שעות", 180),
-             ("שעתיים", 120), ("חצי שעה", 30), ("שעה וחצי", 90), ("שעה אחת", 60), ("שעה", 60)]
+             ("שעתיים", 120), ("חצי שעה", 30), ("שעה וחצי", 90), ("שעה אחת", 60),
+             ("עשר דקות", 10), ("חמש דקות", 5), ("שתי דקות", 2), ("דקותיים", 2), ("שעה", 60)]
     for word, mins in table:
         if word in text:
             return mins
@@ -950,7 +952,9 @@ def _routine_days(r, tamir_day):
     back to flexible placement."""
     raw = r.get("days") or []
     if "כל יום" in raw:
-        return [d for d in DAY_ORDER if d != tamir_day]
+        # "כל יום" = every working day. Saturday is a rest day: routines auto-placed across
+        # the week skip it. A routine that genuinely runs on שבת must list שבת explicitly.
+        return [d for d in DAY_ORDER if d != tamir_day and d != "שבת"]
     specific = [d for d in raw if d in DAY_ORDER and d != tamir_day]
     return specific or None
 
@@ -1154,6 +1158,7 @@ def build_week(fixed, recurring, events, dated_inbox=None):
         candidates = day_pool if len(day_pool) == 1 else _spread_days(name, used_days, day_pool)
         win_s, win_e = _parse_window(r.get("preferred_time"), candidates[0] if candidates else None)
         dur = _parse_duration_he(r.get("preferred_time")) or (win_e - win_s)
+        micro = dur < MICRO_MAX_MIN  # a 2-5 min "send messages" task rides alongside, doesn't own a slot
 
         def try_place(window):
             for day in candidates:
@@ -1161,6 +1166,15 @@ def build_week(fixed, recurring, events, dated_inbox=None):
                     used_days.setdefault(name, set()).add(day)
                     return True
                 ws, we = window if window else _parse_window(r.get("preferred_time"), day)
+                if micro:
+                    # ride in real free time but as parallel, so it never shifts other blocks
+                    anchor = plans[day].free_slot(ws, we, dur, need_home=need_home)
+                    if anchor is None:
+                        anchor = ws
+                    plans[day].place(name, anchor, anchor + dur, energy=r.get("energy", ""),
+                                     parallel=True, out=_is_out(name))
+                    used_days.setdefault(name, set()).add(day)
+                    return True
                 slot = plans[day].free_slot(ws, we, dur, need_home=need_home)
                 if slot is not None:
                     plans[day].place(name, slot, slot + dur, energy=r.get("energy", ""), out=_is_out(name))
@@ -1176,9 +1190,12 @@ def build_week(fixed, recurring, events, dated_inbox=None):
 
     # 4. OPEN WINDOWS (>= 60 min gaps)
     for day, plan in plans.items():
-        cursor = DAY_START_MIN
+        real = [x for x in plan.sorted_blocks() if not x.get("parallel")]
+        if not real:
+            continue  # nothing scheduled -> no open-window noise
+        cursor = real[0]["start"]  # day begins at the first activity; no pre-wake/sleep window
         gaps = []
-        for b in [x for x in plan.sorted_blocks() if not x.get("parallel")]:
+        for b in real:
             if b["start"] - cursor >= 60:
                 gaps.append((cursor, b["start"]))
             cursor = max(cursor, b["end"])
