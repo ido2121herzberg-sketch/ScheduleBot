@@ -819,6 +819,29 @@ MICRO_MAX_MIN = 15  # routines shorter than this are micro-tasks: placed paralle
 OUT_NAMES = ["נסיעה לאופיס", "וולט", "תמיר", "שיעור ריקוד", "הרב יגאל", "כושר"]
 HOME_ONLY_NAMES = ["כתיבת שירים", "הבס", "הופעה", "יצירת תוכן", "סונו", "מהלכי ריקוד"]
 
+# Biweekly pair that alternates week-to-week (one each week). פעם בשבועיים items NOT in a pair
+# stay manual (flagged via weekly exceptions), same as before. (Future: this becomes a data tag.)
+ALTERNATING_PAIR = ("הופעת רחוב", "שיעור ריקוד")
+
+
+def select_biweekly_twin(events, recurring, week_index):
+    """Pick which of the alternating pair runs THIS week.
+    - Deterministic by calendar-week parity -> regenerating in the same week never flips it
+      (important during testing); real week-to-week it alternates and 'lands' on its own.
+    - If the user names one of the pair in this week's exceptions, that overrides parity."""
+    names = sorted({r.get("name") for r in recurring
+                    if r.get("name") in ALTERNATING_PAIR and r.get("frequency") == "פעם בשבועיים"})
+    if not names:
+        return None
+    for ev in (events or []):                    # manual override for this week
+        evn = ev.get("name") or ""
+        for nm in names:
+            if nm in evn:
+                return nm
+    if len(names) == 1:                          # lone item -> every other week
+        return names[0] if week_index % 2 == 0 else None
+    return names[week_index % len(names)]        # the pair -> alternate
+
 
 def _energy_emoji(s):
     """Normalize any energy value (full Hebrew label or emoji) to a single emoji."""
@@ -836,6 +859,14 @@ def _energy_emoji(s):
 def _parse_duration_he(text):
     if not text:
         return None
+    import re
+    # Digit forms first (most common when users type): "2 דקות", "45 דקות", "2 שעות", "1.5 שעות".
+    m = re.search(r"(\d+(?:\.\d+)?)\s*דק", text)          # דקה / דקות
+    if m:
+        return max(1, int(round(float(m.group(1)))))
+    m = re.search(r"(\d+(?:\.\d+)?)\s*שע", text)          # שעה / שעות
+    if m:
+        return int(round(float(m.group(1)) * 60))
     table = [("חמש עשרה דקות", 15), ("שעתיים וחצי", 150), ("שלוש שעות", 180),
              ("שעתיים", 120), ("חצי שעה", 30), ("שעה וחצי", 90), ("שעה אחת", 60),
              ("עשר דקות", 10), ("חמש דקות", 5), ("שתי דקות", 2), ("דקותיים", 2), ("שעה", 60)]
@@ -1246,11 +1277,26 @@ async def generate_and_post(chat_id, context):
     inbox_raw = await get_inbox_tasks_full()
     dated_inbox = classify_dated_inbox(inbox_raw)
 
-    fixed, routines = classify_items(fixed_raw, recurring_raw)
+    israel_tz = pytz.timezone("Asia/Jerusalem")
+    week_index = datetime.now(israel_tz).isocalendar()[1]
+
+    # Alternating biweekly pair: activate exactly one for this week; skip the other.
+    twin = select_biweekly_twin(events, recurring_raw, week_index)
+    recurring_for_build = []
+    for r in recurring_raw:
+        if r.get("name") in ALTERNATING_PAIR and r.get("frequency") == "פעם בשבועיים":
+            if r.get("name") == twin:
+                recurring_for_build.append({**r, "frequency": "שבועי"})  # run it this week
+            # else: the other twin -> not this week
+        else:
+            recurring_for_build.append(r)
+    # if the user named the twin in exceptions, don't ALSO place it as a priority-2 event
+    events = [e for e in events if not (twin and twin in (e.get("name") or ""))]
+
+    fixed, routines = classify_items(fixed_raw, recurring_for_build)
     plans, unplaced, placed_inbox_ids = build_week(fixed, routines, events, dated_inbox=dated_inbox)
     schedule = plans_to_schedule(plans)
 
-    israel_tz = pytz.timezone("Asia/Jerusalem")
     title = "לוז שבועי – " + datetime.now(israel_tz).strftime("%d/%m/%Y")
     page_id, url = await create_schedule_page(title, schedule_to_blocks(schedule))
     if not page_id:
