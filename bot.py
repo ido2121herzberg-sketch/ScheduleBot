@@ -253,6 +253,20 @@ async def get_settings():
     return out
 
 
+def _settings_min(settings, key, default_min):
+    """Read an 'HH:MM' setting and return minutes-from-midnight, else the default."""
+    v = _to_min((settings.get(key) or "").strip())
+    return v if v is not None else default_min
+
+
+def _settings_int(settings, key, default):
+    """Read a numeric setting (e.g. travel_buffer in minutes), else the default."""
+    try:
+        return int((settings.get(key) or "").strip())
+    except (TypeError, ValueError):
+        return default
+
+
 # ===================== ENERGY SUGGESTION (existing feature) =====================
 
 def ask_claude(energy_state, time_info, inbox_tasks, recurring_tasks):
@@ -833,8 +847,15 @@ async def mark_scheduled(page_id):
 # ===================== DETERMINISTIC PLACEMENT ENGINE =====================
 # The model never sets times. This code does. Priority: EVENTS > FIXED > ROUTINES.
 
-DAY_START_MIN, BEDTIME_MIN = 7 * 60 + 30, 23 * 60 + 30
-TRAVEL_BUFFER_MIN = 30
+# Scalar knobs: DEFAULT_* are the code-side fallbacks; the live values (DAY_START_MIN etc.)
+# are overwritten once per /schedule run from the Settings DB (see generate_and_post). The
+# engine reads the live names directly, so setting them per-run propagates everywhere without
+# touching any helper signature. (Single-tenant safe; folds into per-request config in Phase C.)
+DEFAULT_DAY_START_MIN = 7 * 60 + 30
+DEFAULT_BEDTIME_MIN = 23 * 60 + 30
+DEFAULT_TRAVEL_BUFFER_MIN = 30
+DAY_START_MIN, BEDTIME_MIN = DEFAULT_DAY_START_MIN, DEFAULT_BEDTIME_MIN
+TRAVEL_BUFFER_MIN = DEFAULT_TRAVEL_BUFFER_MIN
 DATED_INBOX_DEFAULT_MIN = 90  # default length for a dated inbox task with no duration in זמן מועדף
 MICRO_MAX_MIN = 15  # routines shorter than this are micro-tasks: placed parallel, never their own grid slot
 OUT_NAMES = ["נסיעה לאופיס", "וולט", "תמיר", "שיעור ריקוד", "הרב יגאל", "כושר"]
@@ -1302,6 +1323,14 @@ async def generate_and_post(chat_id, context):
 
     settings = await get_settings()
     rest_day = settings.get("rest_day") or DEFAULT_REST_DAY  # data-driven knob; falls back to שבת
+
+    # Apply the per-user scalar knobs for this run. The engine reads these module-level names
+    # directly, so overwriting them here propagates to every helper. Reset from DEFAULT_* each
+    # run so removing a setting later can't leave a stale value behind.
+    global DAY_START_MIN, BEDTIME_MIN, TRAVEL_BUFFER_MIN
+    DAY_START_MIN = _settings_min(settings, "day_start", DEFAULT_DAY_START_MIN)
+    BEDTIME_MIN = _settings_min(settings, "bedtime", DEFAULT_BEDTIME_MIN)
+    TRAVEL_BUFFER_MIN = _settings_int(settings, "travel_buffer", DEFAULT_TRAVEL_BUFFER_MIN)
 
     israel_tz = pytz.timezone("Asia/Jerusalem")
     week_index = datetime.now(israel_tz).isocalendar()[1]
