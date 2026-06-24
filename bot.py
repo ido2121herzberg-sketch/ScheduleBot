@@ -211,6 +211,7 @@ async def get_recurring_tasks_full():
             "preferred_time": _rtext(props, "זמן מועדף"),
             "days": _multi(props, "יום מועדף"),
             "location": _select(props, "מיקום"),
+            "rotation_group": _select(props, "קבוצת רוטציה"),
         })
     return tasks
 
@@ -867,28 +868,42 @@ MICRO_MAX_MIN = 15  # routines shorter than this are micro-tasks: placed paralle
 # have a מיקום property yet (migrating the inbox is a later step). HOME_ONLY_NAMES is retired.
 OUT_NAMES = ["נסיעה לאופיס", "וולט", "תמיר", "שיעור ריקוד", "הרב יגאל", "כושר"]
 
-# Biweekly pair that alternates week-to-week (one each week). פעם בשבועיים items NOT in a pair
-# stay manual (flagged via weekly exceptions), same as before. (Future: this becomes a data tag.)
-ALTERNATING_PAIR = ("הופעת רחוב", "שיעור ריקוד")
+# Biweekly rotation: routines with תדירות='פעם בשבועיים' that share the same 'קבוצת רוטציה'
+# value take turns — exactly one member runs each week, chosen by calendar-week parity. A
+# biweekly routine with NO group stays manual (only placed if named in the weekly exceptions).
+# (Replaces the old hardcoded ALTERNATING_PAIR=('הופעת רחוב','שיעור ריקוד').)
 
 
-def select_biweekly_twin(events, recurring, week_index):
-    """Pick which of the alternating pair runs THIS week.
-    - Deterministic by calendar-week parity -> regenerating in the same week never flips it
-      (important during testing); real week-to-week it alternates and 'lands' on its own.
-    - If the user names one of the pair in this week's exceptions, that overrides parity."""
-    names = sorted({r.get("name") for r in recurring
-                    if r.get("name") in ALTERNATING_PAIR and r.get("frequency") == "פעם בשבועיים"})
-    if not names:
-        return None
-    for ev in (events or []):                    # manual override for this week
-        evn = ev.get("name") or ""
-        for nm in names:
-            if nm in evn:
-                return nm
-    if len(names) == 1:                          # lone item -> every other week
-        return names[0] if week_index % 2 == 0 else None
-    return names[week_index % len(names)]        # the pair -> alternate
+def select_rotation_actives(events, recurring, week_index):
+    """Return the set of biweekly routine names to activate THIS week (promote to weekly).
+    For each rotation group, pick one member by week parity — deterministic, so regenerating
+    in the same week never flips it; week to week it alternates on its own. If the user names a
+    group member in this week's exceptions, that overrides parity for that group. Biweekly items
+    without a group are never auto-activated (manual via exceptions, same as before)."""
+    groups = {}
+    for r in recurring:
+        if (r.get("frequency") or "") != "פעם בשבועיים":
+            continue
+        g = (r.get("rotation_group") or "").strip()
+        if not g:
+            continue
+        groups.setdefault(g, set()).add(r.get("name"))
+
+    ev_text = " ".join((e.get("name") or "") for e in (events or []))
+    actives = set()
+    for members in groups.values():
+        names = sorted(n for n in members if n)
+        if not names:
+            continue
+        override = next((nm for nm in names if nm in ev_text), None)
+        if override:
+            actives.add(override)                      # user flagged this one this week
+        elif len(names) == 1:
+            if week_index % 2 == 0:
+                actives.add(names[0])                  # lone item -> every other week
+        else:
+            actives.add(names[week_index % len(names)])  # group -> alternate by parity
+    return actives
 
 
 def _energy_emoji(s):
@@ -1350,18 +1365,18 @@ async def generate_and_post(chat_id, context):
     israel_tz = pytz.timezone("Asia/Jerusalem")
     week_index = datetime.now(israel_tz).isocalendar()[1]
 
-    # Alternating biweekly pair: activate exactly one for this week; skip the other.
-    twin = select_biweekly_twin(events, recurring_raw, week_index)
+    # Biweekly rotation: activate one member per rotation group this week; skip the rest.
+    actives = select_rotation_actives(events, recurring_raw, week_index)
     recurring_for_build = []
     for r in recurring_raw:
-        if r.get("name") in ALTERNATING_PAIR and r.get("frequency") == "פעם בשבועיים":
-            if r.get("name") == twin:
+        if r.get("frequency") == "פעם בשבועיים" and (r.get("rotation_group") or "").strip():
+            if r.get("name") in actives:
                 recurring_for_build.append({**r, "frequency": "שבועי"})  # run it this week
-            # else: the other twin -> not this week
+            # else: another member of its group is active this week -> skip
         else:
             recurring_for_build.append(r)
-    # if the user named the twin in exceptions, don't ALSO place it as a priority-2 event
-    events = [e for e in events if not (twin and twin in (e.get("name") or ""))]
+    # if the user named an active rotation item in exceptions, don't ALSO place it as an event
+    events = [e for e in events if not any(a and a in (e.get("name") or "") for a in actives)]
 
     fixed, routines = classify_items(fixed_raw, recurring_for_build)
     plans, unplaced, placed_inbox_ids = build_week(fixed, routines, events,
