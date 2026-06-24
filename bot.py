@@ -210,6 +210,7 @@ async def get_recurring_tasks_full():
             "importance": _select(props, "חשיבות"),
             "preferred_time": _rtext(props, "זמן מועדף"),
             "days": _multi(props, "יום מועדף"),
+            "location": _select(props, "מיקום"),
         })
     return tasks
 
@@ -231,6 +232,7 @@ async def get_fixed_blocks():
             "start": _rtext(props, "שעת התחלה"),
             "end": _rtext(props, "שעת סיום"),
             "energy": _select(props, "אנרגיה"),
+            "location": _select(props, "מיקום"),
         })
     return blocks
 
@@ -858,8 +860,12 @@ DAY_START_MIN, BEDTIME_MIN = DEFAULT_DAY_START_MIN, DEFAULT_BEDTIME_MIN
 TRAVEL_BUFFER_MIN = DEFAULT_TRAVEL_BUFFER_MIN
 DATED_INBOX_DEFAULT_MIN = 90  # default length for a dated inbox task with no duration in זמן מועדף
 MICRO_MAX_MIN = 15  # routines shorter than this are micro-tasks: placed parallel, never their own grid slot
+
+# Out-of-home / home-only used to be inferred from these name lists. Now fixed blocks and
+# routines carry an explicit "מיקום" select (מחוץ לבית / רק בבית / blank=neutral), read via
+# _loc_out / _loc_home below. OUT_NAMES stays ONLY as a fallback for inbox tasks, which don't
+# have a מיקום property yet (migrating the inbox is a later step). HOME_ONLY_NAMES is retired.
 OUT_NAMES = ["נסיעה לאופיס", "וולט", "תמיר", "שיעור ריקוד", "הרב יגאל", "כושר"]
-HOME_ONLY_NAMES = ["כתיבת שירים", "הבס", "הופעה", "יצירת תוכן", "סונו", "מהלכי ריקוד"]
 
 # Biweekly pair that alternates week-to-week (one each week). פעם בשבועיים items NOT in a pair
 # stay manual (flagged via weekly exceptions), same as before. (Future: this becomes a data tag.)
@@ -960,12 +966,19 @@ def _freq_count(freq):
     return {"שבועי": 1, "x2 בשבוע": 2, "x3 בשבוע": 3}.get(freq, 1 if freq == "יומי" else 0)
 
 
-def _is_out(name):
+def _loc_out(location):
+    """Out-of-home from the explicit מיקום property (fixed blocks & routines). Blank = not out."""
+    return (location or "") == "מחוץ לבית"
+
+
+def _loc_home(location):
+    """Home-only from the explicit מיקום property. Blank = neutral (placeable anywhere)."""
+    return (location or "") == "רק בבית"
+
+
+def _name_out(name):
+    """Legacy name-based out-of-home — fallback ONLY for inbox tasks (no מיקום property yet)."""
     return any(k in name for k in OUT_NAMES)
-
-
-def _home_only(name):
-    return any(k in name for k in HOME_ONLY_NAMES)
 
 
 class DayPlan:
@@ -1038,7 +1051,7 @@ def classify_items(fixed_blocks, recurring):
     """Split everything into FIXED (concrete day+time) and ROUTINE (flexible window)."""
     fixed = [dict(name=f["name"], days=f.get("days", []),
                   start=_to_min(f.get("start", "")), end=_to_min(f.get("end", "")),
-                  energy=f.get("energy", "")) for f in fixed_blocks
+                  energy=f.get("energy", ""), location=f.get("location", "")) for f in fixed_blocks
              if _to_min(f.get("start", "")) is not None and _to_min(f.get("end", "")) is not None]
 
     def covered(day, s, e):
@@ -1061,7 +1074,7 @@ def classify_items(fixed_blocks, recurring):
                 e = (ws + dur) if dur else we
                 if not covered(d, ws, e):
                     fixed.append(dict(name=r["name"], days=[d], start=ws, end=e,
-                                      energy=r.get("energy", "")))
+                                      energy=r.get("energy", ""), location=r.get("location", "")))
             continue
 
         has_duration = ("משך" in pt) or (_parse_duration_he(pt) is not None)
@@ -1074,7 +1087,7 @@ def classify_items(fixed_blocks, recurring):
             for d in promote_days:
                 if not covered(d, rng[0], rng[1]):
                     fixed.append(dict(name=r["name"], days=[d], start=rng[0], end=rng[1],
-                                      energy=r.get("energy", "")))
+                                      energy=r.get("energy", ""), location=r.get("location", "")))
         else:
             routines.append(r)
     return fixed, routines
@@ -1164,18 +1177,20 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
             if is_office:
                 plans[day].place(fb["name"], s, e, energy=fb.get("energy", ""), out=True, span=True)
             elif not plans[day].occupied(s, e):
-                plans[day].place(fb["name"], s, e, energy=fb.get("energy", ""), out=_is_out(fb["name"]))
+                plans[day].place(fb["name"], s, e, energy=fb.get("energy", ""), out=_loc_out(fb.get("location", "")))
 
     # 2.5 DATED INBOX (Stage 3): one-time tasks with an explicit day, placed like priority-2.
-    #     Travel buffer only if the task is out-of-home (_is_out). Pinned tasks reserve their
-    #     exact time; day-only tasks take a free slot inside their window. Runs after FIXED so a
-    #     day-only task slots around the skeleton, and before ROUTINES so flexible routines yield.
+    #     Travel buffer only if the task is out-of-home. Inbox tasks have no מיקום property yet,
+    #     so this still uses the name-based fallback (_name_out) until the inbox is migrated.
+    #     Pinned tasks reserve their exact time; day-only tasks take a free slot inside their
+    #     window. Runs after FIXED so a day-only task slots around the skeleton, and before
+    #     ROUTINES so flexible routines yield.
     placed_inbox_ids = []
     for it in (dated_inbox or []):
         name = it.get("name", "")
         if not name:
             continue
-        out = _is_out(name)
+        out = _name_out(name)
         energy = _energy_emoji(it.get("energy", ""))
         pt = it.get("preferred_time", "")
         main = _split_travel(pt)[0]          # זמן מועדף without the travel hint
@@ -1228,7 +1243,7 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
     unplaced, used_days = [], {}
     for r, day_pool in occ:
         name = r["name"]
-        need_home = _home_only(name)
+        need_home = _loc_home(r.get("location", ""))
         strict = any(k in name for k in STRICT_NAMES)
         candidates = day_pool if len(day_pool) == 1 else _spread_days(name, used_days, day_pool)
         win_s, win_e = _parse_window(r.get("preferred_time"), candidates[0] if candidates else None)
@@ -1247,12 +1262,12 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
                     if anchor is None:
                         anchor = ws
                     plans[day].place(name, anchor, anchor + dur, energy=r.get("energy", ""),
-                                     parallel=True, out=_is_out(name))
+                                     parallel=True, out=_loc_out(r.get("location", "")))
                     used_days.setdefault(name, set()).add(day)
                     return True
                 slot = plans[day].free_slot(ws, we, dur, need_home=need_home)
                 if slot is not None:
-                    plans[day].place(name, slot, slot + dur, energy=r.get("energy", ""), out=_is_out(name))
+                    plans[day].place(name, slot, slot + dur, energy=r.get("energy", ""), out=_loc_out(r.get("location", "")))
                     used_days.setdefault(name, set()).add(day)
                     return True
             return False
