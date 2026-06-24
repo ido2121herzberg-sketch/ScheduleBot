@@ -19,6 +19,7 @@ RECURRING_TASKS_DB = "367464c26f0980bfa319c778167a19a3"
 TASK_INBOX_DB = "367464c26f0980ed89b0ca6831f4b27e"
 WEEKLY_SCHEDULES_PARENT = "378464c26f098051ba48e8f539d92328"
 FIXED_BLOCKS_DB = "ca022797f1844cb79c76be05fae5e073"  # בלוקים קבועים
+SETTINGS_DB = "fde6e26e6af3407b82dc1656214dd551"  # הגדרות (Settings) — per-user knobs, key/value
 
 SCHEDULE_MODEL = "claude-sonnet-4-6"
 PARSE_MODEL = "claude-haiku-4-5"
@@ -32,6 +33,7 @@ TIME_CHECK = 4  # /start: how much free time the user has, after picking energy
 
 DAY_ORDER = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"]
 WEEKDAYS = ["ראשון", "שני", "שלישי", "רביעי", "חמישי"]
+DEFAULT_REST_DAY = "שבת"  # code-side fallback if the Settings DB has no rest_day row / isn't shared
 SKIP_WORDS = {"אין", "-", "אין חריגים", "ללא", "כלום"}
 YES_WORDS = {"כן", "כן.", "yes", "אישור", "מאשר", "מאשרת", "✅", "אוקיי", "אוקי"}
 
@@ -231,6 +233,24 @@ async def get_fixed_blocks():
             "energy": _select(props, "אנרגיה"),
         })
     return blocks
+
+
+async def get_settings():
+    """Per-user knobs from the הגדרות (Settings) DB, as a {key: value} dict.
+    Each row: title 'מפתח' = machine key, text 'ערך' = value. If the DB isn't shared with
+    the integration or a key is missing, the caller falls back to a code-side default — so the
+    bot never breaks; it just behaves exactly as the hardcoded version did."""
+    data = await get_notion_data(SETTINGS_DB)
+    if not data:
+        return {}
+    out = {}
+    for page in data.get("results", []):
+        props = page["properties"]
+        key = _title(props, "מפתח")
+        if not key:
+            continue
+        out[key.strip()] = (_rtext(props, "ערך") or "").strip()
+    return out
 
 
 # ===================== ENERGY SUGGESTION (existing feature) =====================
@@ -979,15 +999,16 @@ def _spread_days(name, used_days, week):
     return [d for d in week if d not in used] + [d for d in week if d in used]
 
 
-def _routine_days(r, tamir_day):
-    """Explicit target days for a routine ('כל יום' -> all 7), or None if flexible.
-    Tamir day is excluded (light day); a routine that names only Tamir-day falls
-    back to flexible placement."""
+def _routine_days(r, tamir_day, rest_day=DEFAULT_REST_DAY):
+    """Explicit target days for a routine ('כל יום' -> all working days), or None if flexible.
+    The rest day is excluded from 'כל יום' (it's a day off), but a routine that names the rest
+    day EXPLICITLY in its days still runs then. Tamir day is excluded (light day); a routine
+    that names only Tamir-day falls back to flexible placement."""
     raw = r.get("days") or []
     if "כל יום" in raw:
-        # "כל יום" = every working day. Saturday is a rest day: routines auto-placed across
-        # the week skip it. A routine that genuinely runs on שבת must list שבת explicitly.
-        return [d for d in DAY_ORDER if d != tamir_day and d != "שבת"]
+        # "כל יום" = every working day. The rest day is skipped here; a routine that genuinely
+        # runs on the rest day must list it explicitly (handled by the branch below).
+        return [d for d in DAY_ORDER if d != tamir_day and d != rest_day]
     specific = [d for d in raw if d in DAY_ORDER and d != tamir_day]
     return specific or None
 
@@ -1072,8 +1093,8 @@ def _dated_inbox_timing(pt):
     return None, dur                # window / range / duration-based -> free slot
 
 
-def build_week(fixed, recurring, events, dated_inbox=None):
-    week = DAY_ORDER[:6]  # placement happens Sun–Fri; Sat is mostly its own fixed routine
+def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST_DAY):
+    week = [d for d in DAY_ORDER if d != rest_day]  # placement happens on working days; the rest day is its own fixed routine
     plans = {d: DayPlan(d) for d in DAY_ORDER}
 
     # 1. EVENTS (highest; with travel buffer; can displace fixed)
@@ -1172,7 +1193,7 @@ def build_week(fixed, recurring, events, dated_inbox=None):
     for r in recurring:
         freq = r.get("frequency") or ""
         gym_drop = 1 if (tamir_day and "חדר כושר" in r["name"]) else 0
-        target = _routine_days(r, tamir_day)
+        target = _routine_days(r, tamir_day, rest_day)
         if freq == "יומי":
             for d in (target or routine_week):
                 occ.append((r, [d]))
@@ -1279,6 +1300,9 @@ async def generate_and_post(chat_id, context):
     inbox_raw = await get_inbox_tasks_full()
     dated_inbox = classify_dated_inbox(inbox_raw)
 
+    settings = await get_settings()
+    rest_day = settings.get("rest_day") or DEFAULT_REST_DAY  # data-driven knob; falls back to שבת
+
     israel_tz = pytz.timezone("Asia/Jerusalem")
     week_index = datetime.now(israel_tz).isocalendar()[1]
 
@@ -1296,7 +1320,8 @@ async def generate_and_post(chat_id, context):
     events = [e for e in events if not (twin and twin in (e.get("name") or ""))]
 
     fixed, routines = classify_items(fixed_raw, recurring_for_build)
-    plans, unplaced, placed_inbox_ids = build_week(fixed, routines, events, dated_inbox=dated_inbox)
+    plans, unplaced, placed_inbox_ids = build_week(fixed, routines, events,
+                                                   dated_inbox=dated_inbox, rest_day=rest_day)
     schedule = plans_to_schedule(plans)
 
     title = "לוז שבועי – " + datetime.now(israel_tz).strftime("%d/%m/%Y")
