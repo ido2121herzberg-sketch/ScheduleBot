@@ -28,6 +28,7 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 ENERGY_CHECK = 1
 SCHEDULE_EXCEPTIONS = 2
 SCHEDULE_CONFIRM = 3
+TIME_CHECK = 4  # /start: how much free time the user has, after picking energy
 
 DAY_ORDER = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"]
 WEEKDAYS = ["ראשון", "שני", "שלישי", "רביעי", "חמישי"]
@@ -868,7 +869,8 @@ def _parse_duration_he(text):
     if m:
         return int(round(float(m.group(1)) * 60))
     table = [("חמש עשרה דקות", 15), ("שעתיים וחצי", 150), ("שלוש שעות", 180),
-             ("שעתיים", 120), ("חצי שעה", 30), ("שעה וחצי", 90), ("שעה אחת", 60),
+             ("ארבע שעות", 240), ("חמש שעות", 300), ("שעתיים", 120), ("חצי שעה", 30),
+             ("שעה וחצי", 90), ("שעה אחת", 60),
              ("עשר דקות", 10), ("חמש דקות", 5), ("שתי דקות", 2), ("דקותיים", 2), ("שעה", 60)]
     for word, mins in table:
         if word in text:
@@ -1511,6 +1513,82 @@ async def handle_schedule_callback(update: Update, context: ContextTypes.DEFAULT
     elif query.data == "regen_schedule":
         await query.edit_message_text("בונה מחדש... 🔄")
         await generate_and_post(query.message.chat_id, context)
+    elif query.data.startswith("moodpick:"):
+        try:
+            i = int(query.data.split(":")[1])
+        except (ValueError, IndexError):
+            return
+        sug = context.user_data.get("mood_suggestions", [])
+        if 0 <= i < len(sug):
+            p = sug[i]
+            await query.edit_message_text(f"יאללה — {p['name']} 💪 ({p['dur']} דק')\nתיהנה!")
+
+
+# ===================== MOOD POOL (/start energy flow) =====================
+# Pool = tasks the user does only "if they feel like it". Signal (per spec): חשיבות/Priority
+# == "זמן פנוי", in BOTH the recurring DB and the inbox. build_week already skips these, so
+# their time stays an open window; /start offers them to fill it by energy + available time.
+
+TIME_CHOICES = [["🕐 חצי שעה", "🕐 שעה"], ["🕐 שעתיים", "🕐 3 שעות+"]]
+
+
+def parse_time_choice(text):
+    text = text or ""
+    if "חצי שעה" in text:
+        return 30
+    if "שעתיים" in text:
+        return 120
+    if "3 שעות" in text or "3+" in text or "שלוש שעות" in text:
+        return 180
+    if "שעה" in text:
+        return 60
+    return None
+
+
+def _energy_allows(task_energy, chosen):
+    """🟢→🟢 only; 🟡→🟡 or 🟢; 🔴→🔴 only. Blank task energy matches anything."""
+    if not task_energy:
+        return True
+    if chosen == "🟢":
+        return task_energy == "🟢"
+    if chosen == "🟡":
+        return task_energy in ("🟡", "🟢")
+    if chosen == "🔴":
+        return task_energy == "🔴"
+    return True
+
+
+def build_mood_pool(recurring_full, inbox_full):
+    """Gather pool members from both sources. Inbox members must be חשיבות=זמן פנוי AND have no
+    assigned day (a dated one is handled by the weekly schedule, not offered here)."""
+    pool = []
+    for r in recurring_full:
+        if (r.get("importance") or "") == "זמן פנוי":
+            pool.append({
+                "name": r["name"],
+                "energy": _energy_emoji(r.get("energy", "")),
+                "dur": _parse_duration_he(r.get("preferred_time")) or 60,
+                "src": "שגרה",
+            })
+    for t in inbox_full:
+        has_day = any(d in DAY_ORDER for d in (t.get("days") or []))
+        if (t.get("priority") or "") == "זמן פנוי" and not has_day:
+            pool.append({
+                "name": t["name"],
+                "energy": _energy_emoji(t.get("energy", "")),
+                "dur": _parse_duration_he(t.get("preferred_time")) or 60,
+                "src": "אינבוקס",
+            })
+    return pool
+
+
+def match_mood_pool(pool, chosen_energy, available_min):
+    matches = [p for p in pool
+               if _energy_allows(p["energy"], chosen_energy) and p["dur"] <= available_min]
+    # nicest-first: higher-energy tasks first, then shorter ones (easier to start)
+    rank = {"🟢": 0, "🟡": 1, "🔴": 2, "": 3}
+    matches.sort(key=lambda p: (rank.get(p["energy"], 3), p["dur"]))
+    return matches[:6]
 
 
 # ===================== EXISTING FEATURES =====================
@@ -1533,12 +1611,39 @@ async def handle_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("תבחר אנרגיה מהכפתורים 😊")
         return ENERGY_CHECK
-    await update.message.reply_text("רגע אחד...")
-    time_info = get_current_time_info()
-    inbox_tasks = await get_inbox_tasks()
-    recurring_tasks = await get_recurring_tasks()
-    response = ask_claude(energy, time_info, inbox_tasks, recurring_tasks)
-    await update.message.reply_text(response)
+    context.user_data["mood_energy"] = energy
+    reply_markup = ReplyKeyboardMarkup(TIME_CHOICES, one_time_keyboard=True, resize_keyboard=True)
+    await update.message.reply_text("כמה זמן פנוי יש לך עכשיו?", reply_markup=reply_markup)
+    return TIME_CHECK
+
+
+async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mins = parse_time_choice(update.message.text)
+    if mins is None:
+        await update.message.reply_text("תבחר זמן מהכפתורים 🙂")
+        return TIME_CHECK
+    energy = context.user_data.get("mood_energy", "🟡")
+    await update.message.reply_text("רגע, בודק מה מתאים...")
+    recurring_full = await get_recurring_tasks_full()
+    inbox_full = await get_inbox_tasks_full()
+    pool = build_mood_pool(recurring_full, inbox_full)
+    matches = match_mood_pool(pool, energy, mins)
+    context.user_data["mood_suggestions"] = matches
+
+    if not matches:
+        await update.message.reply_text(
+            f"אין כרגע משימות מאגר שמתאימות ל-{energy} ולזמן הזה. "
+            "אפשר פשוט לנוח, או לבחור אנרגיה/זמן אחרים עם /start 🙂"
+        )
+        return ConversationHandler.END
+
+    buttons = [[InlineKeyboardButton(f"{p['energy']} {p['name']} · {p['dur']} דק'",
+                                     callback_data=f"moodpick:{i}")]
+               for i, p in enumerate(matches)]
+    await update.message.reply_text(
+        "הנה כמה דברים מהמאגר שמתאימים לך עכשיו 👇\nבחר אחד (או פשוט תתעלם):",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
     return ConversationHandler.END
 
 
@@ -1563,7 +1668,10 @@ def main():
 
     energy_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
-        states={ENERGY_CHECK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_energy)]},
+        states={
+            ENERGY_CHECK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_energy)],
+            TIME_CHECK: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time)],
+        },
         fallbacks=[CommandHandler("cancel", cancel)]
     )
 
