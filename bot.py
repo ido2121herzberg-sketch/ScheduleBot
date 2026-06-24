@@ -1048,17 +1048,17 @@ def _spread_days(name, used_days, week):
     return [d for d in week if d not in used] + [d for d in week if d in used]
 
 
-def _routine_days(r, tamir_day, rest_day=DEFAULT_REST_DAY):
+def _routine_days(r, anchor_day, rest_day=DEFAULT_REST_DAY):
     """Explicit target days for a routine ('כל יום' -> all working days), or None if flexible.
     The rest day is excluded from 'כל יום' (it's a day off), but a routine that names the rest
-    day EXPLICITLY in its days still runs then. Tamir day is excluded (light day); a routine
-    that names only Tamir-day falls back to flexible placement."""
+    day EXPLICITLY in its days still runs then. The anchor day is excluded (light day); a routine
+    that names only the anchor day falls back to flexible placement."""
     raw = r.get("days") or []
     if "כל יום" in raw:
         # "כל יום" = every working day. The rest day is skipped here; a routine that genuinely
         # runs on the rest day must list it explicitly (handled by the branch below).
-        return [d for d in DAY_ORDER if d != tamir_day and d != rest_day]
-    specific = [d for d in raw if d in DAY_ORDER and d != tamir_day]
+        return [d for d in DAY_ORDER if d != anchor_day and d != rest_day]
+    specific = [d for d in raw if d in DAY_ORDER and d != anchor_day]
     return specific or None
 
 
@@ -1142,7 +1142,7 @@ def _dated_inbox_timing(pt):
     return None, dur                # window / range / duration-based -> free slot
 
 
-def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST_DAY):
+def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST_DAY, anchor=None):
     week = [d for d in DAY_ORDER if d != rest_day]  # placement happens on working days; the rest day is its own fixed routine
     plans = {d: DayPlan(d) for d in DAY_ORDER}
 
@@ -1158,20 +1158,34 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
             plans[day].place("נסיעה ל" + ev["name"], max(DAY_START_MIN, start - TRAVEL_BUFFER_MIN), start, out=True)
             plans[day].place(ev["name"], start, end, out=True)
 
-    # ---- TAMIR DAY: special flow (leave 11:00, מענה parallel in transit, evening TLV gym) ----
-    tamir_day, tamir_fb = None, None
-    for fb in fixed:
-        if "תמיר" in fb["name"]:
-            tamir_day = fb["days"][0] if fb["days"] else None
-            tamir_fb = fb
-            break
-    if tamir_day:
-        s_start, s_end = tamir_fb["start"], tamir_fb["end"]
-        plans[tamir_day].place("נסיעה למודיעין", 11 * 60, s_start, out=True)
-        plans[tamir_day].place("מענה ראשון לתלמידים", 11 * 60, 11 * 60 + 90, parallel=True, out=True)
-        plans[tamir_day].place("נסיעה חזרה ממודיעין", s_end, s_end + 90, out=True)
-        plans[tamir_day].place("מענה שני לתלמידים", s_end, s_end + 90, parallel=True, out=True)
-        plans[tamir_day].place("חדר כושר (תל אביב)", s_end + 90, s_end + 90 + 120, out=True)
+    # ---- ANCHOR DAY: a weekly out-of-town anchor, configured via Settings (anchor_*).
+    #      Builds the day around the anchor block: leave home -> travel out (with an optional
+    #      in-transit task running parallel) -> the anchor block itself -> travel back (+ optional
+    #      in-transit task) -> optional evening activity. Also makes the day light and lets the
+    #      evening activity substitute a routine (see gym_drop). anchor is None / trigger blank
+    #      -> no anchor day (feature off; nothing Ido-specific remains in the code).
+    anchor_day, anchor_fb = None, None
+    if anchor and anchor.get("trigger"):
+        for fb in fixed:
+            if anchor["trigger"] in fb["name"]:
+                anchor_day = fb["days"][0] if fb["days"] else None
+                anchor_fb = fb
+                break
+    if anchor and anchor_day:
+        s_start, s_end = anchor_fb["start"], anchor_fb["end"]
+        dest = anchor.get("destination", "")
+        leave, tmin = anchor.get("leave"), anchor.get("transit_min", 0)
+        ret, eve_min = anchor.get("return_min", 0), anchor.get("evening_min", 0)
+        plans[anchor_day].place("נסיעה ל" + dest, leave, s_start, out=True)
+        if anchor.get("transit_out"):
+            plans[anchor_day].place(anchor["transit_out"], leave, leave + tmin, parallel=True, out=True)
+        plans[anchor_day].place("נסיעה חזרה מ" + dest, s_end, s_end + ret, out=True)
+        if anchor.get("transit_back"):
+            plans[anchor_day].place(anchor["transit_back"], s_end, s_end + tmin, parallel=True, out=True)
+        if anchor.get("evening"):
+            plans[anchor_day].place(anchor["evening"], s_end + ret, s_end + ret + eve_min, out=True)
+    transit_names = [t for t in (anchor.get("transit_out"), anchor.get("transit_back"))
+                     if t] if anchor else []
 
     # 2. FIXED (office = permeable span; others exclusive; skip if event took the slot)
     #    Placed earliest-start first (then longest first) so an earlier/longer commitment
@@ -1183,7 +1197,7 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
         for day in fb["days"]:
             if day not in plans:
                 continue
-            if day == tamir_day and ("מענה" in fb["name"]):
+            if day == anchor_day and any(t in fb["name"] or fb["name"] in t for t in transit_names):
                 continue
             key = (day, s, e, fb["name"])
             if key in seen:
@@ -1239,12 +1253,14 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
 
     # 3. ROUTINES (flexible, distributed; durations & windows from Notion)
     STRICT_NAMES = ["חדר כושר", "כתיבת שירים", "השלמת תוכן"]
-    routine_week = [d for d in week if d != tamir_day]  # Tamir day is a light day
+    routine_week = [d for d in week if d != anchor_day]  # the anchor day is a light day
+    sub_name = (anchor.get("evening_substitutes") if anchor else "") or ""
     occ = []  # each entry: (routine, day_pool) — the days this occurrence may use
     for r in recurring:
         freq = r.get("frequency") or ""
-        gym_drop = 1 if (tamir_day and "חדר כושר" in r["name"]) else 0
-        target = _routine_days(r, tamir_day, rest_day)
+        # the anchor evening activity counts as one occurrence of the routine it substitutes
+        gym_drop = 1 if (anchor_day and sub_name and sub_name in r["name"]) else 0
+        target = _routine_days(r, anchor_day, rest_day)
         if freq == "יומי":
             for d in (target or routine_week):
                 occ.append((r, [d]))
@@ -1362,6 +1378,23 @@ async def generate_and_post(chat_id, context):
     BEDTIME_MIN = _settings_min(settings, "bedtime", DEFAULT_BEDTIME_MIN)
     TRAVEL_BUFFER_MIN = _settings_int(settings, "travel_buffer", DEFAULT_TRAVEL_BUFFER_MIN)
 
+    # Anchor-day config (the out-of-town weekly anchor). Built only if anchor_trigger is set;
+    # otherwise None -> no anchor day. All values are data, nothing is hardcoded to one user.
+    anchor = None
+    if (settings.get("anchor_trigger") or "").strip():
+        anchor = {
+            "trigger": settings.get("anchor_trigger", "").strip(),
+            "leave": _settings_min(settings, "anchor_leave", 11 * 60),
+            "destination": (settings.get("anchor_destination") or "").strip(),
+            "return_min": _settings_int(settings, "anchor_return_min", 90),
+            "transit_out": (settings.get("anchor_transit_out") or "").strip(),
+            "transit_back": (settings.get("anchor_transit_back") or "").strip(),
+            "transit_min": _settings_int(settings, "anchor_transit_min", 90),
+            "evening": (settings.get("anchor_evening") or "").strip(),
+            "evening_min": _settings_int(settings, "anchor_evening_min", 120),
+            "evening_substitutes": (settings.get("anchor_evening_substitutes") or "").strip(),
+        }
+
     israel_tz = pytz.timezone("Asia/Jerusalem")
     week_index = datetime.now(israel_tz).isocalendar()[1]
 
@@ -1380,7 +1413,8 @@ async def generate_and_post(chat_id, context):
 
     fixed, routines = classify_items(fixed_raw, recurring_for_build)
     plans, unplaced, placed_inbox_ids = build_week(fixed, routines, events,
-                                                   dated_inbox=dated_inbox, rest_day=rest_day)
+                                                   dated_inbox=dated_inbox, rest_day=rest_day,
+                                                   anchor=anchor)
     schedule = plans_to_schedule(plans)
 
     title = "לוז שבועי – " + datetime.now(israel_tz).strftime("%d/%m/%Y")
