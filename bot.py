@@ -861,6 +861,10 @@ DAY_START_MIN, BEDTIME_MIN = DEFAULT_DAY_START_MIN, DEFAULT_BEDTIME_MIN
 TRAVEL_BUFFER_MIN = DEFAULT_TRAVEL_BUFFER_MIN
 DATED_INBOX_DEFAULT_MIN = 90  # default length for a dated inbox task with no duration in זמן מועדף
 MICRO_MAX_MIN = 15  # routines shorter than this are micro-tasks: placed parallel, never their own grid slot
+ANCHOR_DAY_MAX_MIN = 30  # the anchor (light) day stays light, but still permits a routine that
+                         # EXPLICITLY lists it AND is short (<= this many minutes) — a quick habit
+                         # (e.g. a 30-min trading journal) is fine on a light day; longer focused
+                         # work (content, practice) is not, so it keeps being excluded from it.
 
 # Out-of-home / home-only used to be inferred from these name lists. Now fixed blocks and
 # routines carry an explicit "מיקום" select (מחוץ לבית / רק בבית / blank=neutral), read via
@@ -1051,14 +1055,19 @@ def _spread_days(name, used_days, week):
 def _routine_days(r, anchor_day, rest_day=DEFAULT_REST_DAY):
     """Explicit target days for a routine ('כל יום' -> all working days), or None if flexible.
     The rest day is excluded from 'כל יום' (it's a day off), but a routine that names the rest
-    day EXPLICITLY in its days still runs then. The anchor day is excluded (light day); a routine
-    that names only the anchor day falls back to flexible placement."""
+    day EXPLICITLY in its days still runs then. The anchor day is excluded (light day) too —
+    EXCEPT for a routine that explicitly names the anchor day AND is short (<= ANCHOR_DAY_MAX_MIN):
+    a quick habit (e.g. a 30-min journal) is allowed on the light day; longer focused work is not.
+    A routine that names only the anchor day but is long falls back to flexible placement."""
     raw = r.get("days") or []
     if "כל יום" in raw:
         # "כל יום" = every working day. The rest day is skipped here; a routine that genuinely
-        # runs on the rest day must list it explicitly (handled by the branch below).
+        # runs on the rest day must list it explicitly (handled by the branch below). The anchor
+        # day is also kept light here — a habit that wants the anchor day must name it explicitly.
         return [d for d in DAY_ORDER if d != anchor_day and d != rest_day]
-    specific = [d for d in raw if d in DAY_ORDER and d != anchor_day]
+    dur = _parse_duration_he(r.get("preferred_time"))
+    keep_anchor = dur is not None and dur <= ANCHOR_DAY_MAX_MIN  # short habit may use the light day
+    specific = [d for d in raw if d in DAY_ORDER and (d != anchor_day or keep_anchor)]
     return specific or None
 
 
