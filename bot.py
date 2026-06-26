@@ -356,26 +356,53 @@ def _claude_json(model, prompt, max_tokens=4000):
     return json.loads(raw)
 
 
+def normalize_directives(raw):
+    """Clean raw parser output into engine-ready directives; drop anything malformed."""
+    out = []
+    for d in (raw or []):
+        action = (d.get("action") or "").strip()
+        if action not in ("skip", "move", "off"):
+            continue
+        target = (d.get("target") or "").strip() or None
+        day = (d.get("day") or "").strip() or None
+        if day and day not in DAY_ORDER:
+            day = None
+        if action == "move" and not day:
+            continue
+        if action in ("skip", "move") and not target:
+            continue
+        if action == "off" and not day:
+            continue
+        out.append({"action": action, "target": target, "day": day})
+    return out
+
+
 def parse_exceptions(text):
-    prompt = f"""אתה מנתח קלט עבור עוזר אישי. המשתמש כתב את החריגים והאירועים שלו לשבוע הקרוב.
-פרק כל אירוע לרשומה מובנית. החזר אך ורק JSON בפורמט הזה:
-{{"events":[{{"name":"שם האירוע","days":["שלישי"],"time":"16:00","recurring":false,"energy":"","priority":"","duration_min":null}}]}}
+    prompt = f"""אתה מנתח קלט לעוזר אישי. עידו כותב בעברית חופשית את החריגים שלו לשבוע הקרוב.
+החזר JSON אחד עם שני שדות: "events" (דברים להוסיף) ו-"directives" (לבטל / להזיז / חופש).
+אתה רק מסווג ומחלץ — אתה לא קובע שעות ולא בונה לוז.
 
-כללים:
-- days: רשימת ימים בעברית (ראשון..שבת). אם נאמר "כל יום" שים ["כל יום"]. אם לא צוין יום, השאר [].
-- **קריטי — יום מפורש:** אם המשתמש ציין יום מפורש (למשל "ביום רביעי", "ברביעי", "מחר", "ביום שלישי") — קבע בדיוק את אותו יום. לעולם אל תשנה את היום, אל תנחש יום אחר, ואל תעביר ליום סמוך. טעות ביום היא הטעות החמורה ביותר.
-- time: שעה בפורמט HH:MM אם צוינה, אחרת "גמיש". עגל ל-:00 או :30. אל תשתמש לעולם ב-23:59.
-- **שם האירוע = בדיוק המילים שהמשתמש כתב, בעברית. אל תתרגם לאנגלית לעולם. אל תקצר, אל תפרש ואל תהפוך שם לתיאור.** שמות מקומות/אירועים נשמרים מילה-במילה. למשל "ערב לא ברור" הוא ערב בפאב ששמו "לא ברור" — שם האירוע הוא "ערב לא ברור" במלואו (לא "ערב", לא "unclear").
-- כל אירוע נפרד = רשומה נפרדת. לעולם אל תמזג שני אירועים לאחד, ולעולם אל תשמיט אירוע שהוזכר. שעה ששייכת לאירוע אחד לא עוברת לאירוע אחר.
-- recurring: true אם זה חוזר, אחרת false.
-- energy/priority: רק אם נרמז, אחרת "".
-- duration_min: מספר דקות אם צוין, אחרת null.
-- אל תמציא פרטים שלא נאמרו ואל תוסיף אירועים שלא הוזכרו.
-בלי טקסט נוסף, בלי markdown.
+events — אירוע חד-פעמי חדש (חתונה, פגישה, ערב בפאב). פורמט:
+{{"name":"שם","days":["שלישי"],"time":"16:00","recurring":false,"energy":"","priority":"","duration_min":null}}
+- days: ימים בעברית; אם לא צוין יום []; "כל יום" → ["כל יום"].
+- יום מפורש קדוש: אם צוין יום — בדיוק אותו יום. name = בדיוק המילים של עידו, בלי תרגום/קיצור.
+- time: HH:MM או "גמיש"; עגל ל-:00/:30; לעולם לא 23:59.
 
-הקלט של המשתמש:
+directives — שינוי על השגרה הקיימת:
+- "skip": ביטול קיים. "בלי תמיר השבוע" → {{"action":"skip","target":"תמיר","day":null}};
+  "בלי כושר ברביעי" → {{"action":"skip","target":"כושר","day":"רביעי"}}.
+- "move": העברה ליום אחר. "תמיר ביום שלישי" → {{"action":"move","target":"תמיר","day":"שלישי"}}.
+- "off": יום חופש מלא. "חופש ביום ראשון" → {{"action":"off","target":null,"day":"ראשון"}};
+  טווח "חופש ראשון עד רביעי" → רשומת off נפרדת לכל יום.
+כללים: target = שם כפי שעידו מתייחס אליו, בלי תרגום (ב-off → null). day = יום עברי או null.
+תוספת → events; ביטול/העברה/חופש → directives; אל תכפיל לשני השדות. אין מסוג מסוים → רשימה ריקה.
+החזר אך ורק JSON: {{"events":[...], "directives":[...]}}. בלי טקסט נוסף, בלי markdown.
+
+הקלט:
 {text}"""
-    return _claude_json(SCHEDULE_MODEL, prompt, max_tokens=1500).get("events", [])
+    data = _claude_json(SCHEDULE_MODEL, prompt, max_tokens=1800)
+    return {"events": data.get("events", []) or [],
+            "directives": normalize_directives(data.get("directives", []))}
 
 
 def reparse_with_correction(events, correction):
@@ -391,9 +418,9 @@ def reparse_with_correction(events, correction):
     return _claude_json(PARSE_MODEL, prompt, max_tokens=1500).get("events", events)
 
 
-def build_readback(events):
-    if not events:
-        return "לא זיהיתי אירועים מיוחדים השבוע."
+def build_readback(events, directives=None):
+    if not events and not directives:
+        return "לא זיהיתי חריגים השבוע."
 
     def is_dated(e):
         d = e.get("days") or []
@@ -430,6 +457,19 @@ def build_readback(events):
             extra.append(f"{e['duration_min']} דק'")
         suffix = (" — " + ", ".join(extra)) if extra else ""
         lines.append(f"• {e.get('name','')}: {days}, {t}, {kind}{suffix}")
+
+    if directives:
+        lines.append("")
+        lines.append("שינויים על השגרה הרגילה:")
+        for d in directives:
+            act, tgt, day = d["action"], d["target"], d["day"]
+            if act == "off":
+                lines.append(f"🌴 חופש — יום {day}")
+            elif act == "skip":
+                where = f" ביום {day}" if day else " (כל השבוע)"
+                lines.append(f"🚫 בלי {tgt}{where}")
+            elif act == "move":
+                lines.append(f"↪️ {tgt} → יום {day}")
 
     if dated:
         lines.append("\n⚠️ בדוק שהימים שמסומנים ב-📌 נכונים לפני שאתה מאשר.")
@@ -1515,6 +1555,7 @@ async def schedule_exceptions_received(update: Update, context: ContextTypes.DEF
     text = (update.message.text or "").strip()
     if text in SKIP_WORDS:
         context.user_data["parsed_events"] = []
+        context.user_data["parsed_directives"] = []
         await update.message.reply_text("אין חריגים. בונה את הלוח... (יכול לקחת חצי דקה)")
         await generate_and_post(update.effective_chat.id, context)
         return ConversationHandler.END
@@ -1522,14 +1563,16 @@ async def schedule_exceptions_received(update: Update, context: ContextTypes.DEF
     await update.message.reply_text("רגע, מנתח את מה שכתבת...")
     context.user_data["exceptions_text"] = text
     try:
-        events = await asyncio.to_thread(parse_exceptions, text)
+        parsed = await asyncio.to_thread(parse_exceptions, text)
     except Exception as e:
         print(f"parse error: {e}")
-        events = [{"name": text, "days": [], "time": "גמיש", "recurring": False,
-                   "energy": "", "priority": "", "duration_min": None}]
-    context.user_data["parsed_events"] = events
+        parsed = {"events": [{"name": text, "days": [], "time": "גמיש", "recurring": False,
+                              "energy": "", "priority": "", "duration_min": None}],
+                  "directives": []}
+    context.user_data["parsed_events"] = parsed["events"]
+    context.user_data["parsed_directives"] = parsed["directives"]
     await update.message.reply_text(
-        build_readback(events) + "\n\nנכון? כתוב \"כן\" לאישור, או תקן אותי במילים שלך."
+        build_readback(parsed["events"], parsed["directives"]) + "\n\nנכון? כתוב \"כן\" לאישור, או תקן אותי במילים שלך."
     )
     return SCHEDULE_CONFIRM
 
@@ -1542,22 +1585,28 @@ async def schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await update.message.reply_text("רגע, מעדכן...")
-    prev = context.user_data.get("parsed_events", [])
+    prev_events = context.user_data.get("parsed_events", [])
+    prev_dirs = context.user_data.get("parsed_directives", [])
     base_text = context.user_data.get("exceptions_text", "")
     full_text = (base_text + "\n\nהבהרה/תיקון נוסף מהמשתמש: " + text).strip()
     failed = False
     try:
-        events = await asyncio.to_thread(parse_exceptions, full_text)
-        if not events:
-            events = prev
+        parsed = await asyncio.to_thread(parse_exceptions, full_text)
+        events = parsed["events"]
+        directives = parsed["directives"]
+        if not events and not directives:
+            events = prev_events
+            directives = prev_dirs
             failed = True
     except Exception as e:
         print(f"reparse error: {e}")
-        events = prev
+        events = prev_events
+        directives = prev_dirs
         failed = True
 
     context.user_data["exceptions_text"] = full_text
     context.user_data["parsed_events"] = events
+    context.user_data["parsed_directives"] = directives
 
     if failed:
         await update.message.reply_text(
@@ -1566,16 +1615,16 @@ async def schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return SCHEDULE_CONFIRM
 
-    if events == prev:
+    if events == prev_events and directives == prev_dirs:
         await update.message.reply_text(
-            build_readback(events) +
+            build_readback(events, directives) +
             '\n\nℹ️ זה כבר מסומן בדיוק ככה — לא היה מה לשנות. כתוב "כן" לאישור, '
             "או תגיד מפורש איזה אירוע ומה לשנות בו."
         )
         return SCHEDULE_CONFIRM
 
     await update.message.reply_text(
-        build_readback(events) + '\n\nנכון עכשיו? "כן" לאישור, או תקן שוב.'
+        build_readback(events, directives) + '\n\nנכון עכשיו? "כן" לאישור, או תקן שוב.'
     )
     return SCHEDULE_CONFIRM
 
