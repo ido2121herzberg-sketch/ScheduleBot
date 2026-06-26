@@ -21,6 +21,13 @@ WEEKLY_SCHEDULES_PARENT = "378464c26f098051ba48e8f539d92328"
 FIXED_BLOCKS_DB = "ca022797f1844cb79c76be05fae5e073"  # בלוקים קבועים
 SETTINGS_DB = "fde6e26e6af3407b82dc1656214dd551"  # הגדרות (Settings) — per-user knobs, key/value
 
+# Notion API version. 2022-06-28 (legacy) queries /v1/databases/{id}/query and is BLIND to rows
+# created via the newer data-source API — that was the "journal renders nowhere" bug. 2025-09-03
+# adds /v1/data_sources/{ds}/query, which sees every row. We resolve each DB's data-source id at
+# runtime (cached) and fall back to the legacy endpoint if resolution ever fails, so a deploy can
+# never read LESS than before. Page create/patch endpoints are unchanged across versions.
+NOTION_VERSION = "2025-09-03"
+
 SCHEDULE_MODEL = "claude-sonnet-4-6"
 PARSE_MODEL = "claude-haiku-4-5"
 
@@ -86,17 +93,57 @@ def get_current_time_info():
     return {"time": now.strftime("%H:%M"), "day": days[now.weekday()]}
 
 
-async def get_notion_data(database_id, filter_body=None):
-    url = f"https://api.notion.com/v1/databases/{database_id}/query"
-    headers = {
+def _notion_headers():
+    return {
         "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json"
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
     }
-    body = filter_body if filter_body else {}
+
+
+# DB id -> data-source id, resolved once and cached for the process lifetime. Empty/failed
+# lookups are NOT cached, so a transient error just retries next run.
+_DS_CACHE = {}
+
+
+async def _resolve_data_source_id(database_id):
+    """Return the primary data-source id for a database, or None if it can't be resolved.
+    Under Notion-Version 2025-09-03 the database object carries a data_sources[] array; we take
+    the first (these are all single-source DBs). Cached. None -> caller uses the legacy endpoint."""
+    if database_id in _DS_CACHE:
+        return _DS_CACHE[database_id]
+    url = f"https://api.notion.com/v1/databases/{database_id}"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.post(url, headers=headers, json=body)
+            resp = await client.get(url, headers=_notion_headers())
+            data = resp.json()
+    except Exception as e:
+        print(f"Notion ds-resolve error ({database_id}): {e}")
+        return None
+    sources = data.get("data_sources") or []
+    if not sources:
+        # Could be an older API shape or a permissions issue — signal legacy fallback.
+        print(f"Notion ds-resolve: no data_sources for {database_id} (resp keys: {list(data)[:5]})")
+        return None
+    ds_id = sources[0].get("id")
+    if ds_id:
+        _DS_CACHE[database_id] = ds_id
+    return ds_id
+
+
+async def get_notion_data(database_id, filter_body=None):
+    """Query a database's rows. Prefers the 2025-09-03 data-source endpoint (sees ALL rows,
+    including those created via the newer API); falls back to the legacy /v1/databases endpoint
+    if the data source can't be resolved, so behavior never regresses below the old code."""
+    body = filter_body if filter_body else {}
+    ds_id = await _resolve_data_source_id(database_id)
+    if ds_id:
+        url = f"https://api.notion.com/v1/data_sources/{ds_id}/query"
+    else:
+        url = f"https://api.notion.com/v1/databases/{database_id}/query"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(url, headers=_notion_headers(), json=body)
             return response.json()
     except Exception as e:
         print(f"Notion error: {e}")
@@ -105,14 +152,9 @@ async def get_notion_data(database_id, filter_body=None):
 
 async def notion_request(method, path, body=None):
     url = f"https://api.notion.com/v1/{path}"
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json"
-    }
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.request(method, url, headers=headers, json=body)
+            response = await client.request(method, url, headers=_notion_headers(), json=body)
             return response.json()
     except Exception as e:
         print(f"Notion request error ({method} {path}): {e}")
@@ -1449,86 +1491,6 @@ async def generate_and_post(chat_id, context):
                 uniq.append(u)
         msg += "\n\nℹ️ לא נמצא מקום השבוע ל: " + ", ".join(uniq) + " (השבוע עמוס — אפשר לפנות זמן ידנית)."
     msg += "\nלאשר?"
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ אשר", callback_data="approve_schedule"),
-        InlineKeyboardButton("🔄 צור מחדש", callback_data="regen_schedule"),
-    ]])
-    await context.bot.send_message(chat_id, msg, reply_markup=keyboard)
-
-
-async def _OLD_generate_and_post(chat_id, context):
-    events = context.user_data.get("parsed_events", [])
-
-    prev = context.user_data.get("draft_page_id")
-    if prev:
-        try:
-            await archive_page(prev)
-        except Exception as e:
-            print(f"archive error: {e}")
-        context.user_data["draft_page_id"] = None
-
-    fixed = await get_fixed_blocks()
-    if not fixed:
-        await context.bot.send_message(
-            chat_id,
-            "לא הצלחתי לקרוא את הבלוקים הקבועים. ודא שה-integration של הבוט מחובר לדאטהבייס 'בלוקים קבועים'."
-        )
-        return
-    fixed_by_day = skeleton_by_day(fixed)
-    recurring = await get_recurring_tasks_full()
-    inbox = await get_inbox_tasks_full()
-
-    prompt = build_schedule_prompt(fixed_by_day, recurring, inbox, events)
-    try:
-        result = await asyncio.to_thread(generate_schedule_json, prompt)
-    except Exception as e:
-        print(f"generation error: {e}")
-        await context.bot.send_message(chat_id, "הבנייה נכשלה (שגיאת JSON או מודל). נסה שוב עם /schedule.")
-        return
-
-    schedule = result.get("schedule", [])
-    ids = result.get("scheduled_inbox_ids", [])
-
-    violations = validate_schedule(schedule, fixed_by_day, events, recurring)
-    attempts = 0
-    while violations and attempts < 2:
-        if attempts == 0:
-            await context.bot.send_message(chat_id, "כמעט מוכן, מתקן כמה פרטים אחרונים...")
-        try:
-            repaired = await asyncio.to_thread(generate_schedule_json, build_repair_prompt(schedule, violations))
-            schedule = repaired.get("schedule", schedule)
-            if repaired.get("scheduled_inbox_ids"):
-                ids = repaired.get("scheduled_inbox_ids")
-        except Exception as e:
-            print(f"repair error: {e}")
-            break
-        violations = validate_schedule(schedule, fixed_by_day, events, recurring)
-        attempts += 1
-
-    schedule = merge_open_windows(schedule)
-    remaining = violations
-
-    israel_tz = pytz.timezone("Asia/Jerusalem")
-    title = "לוז שבועי – " + datetime.now(israel_tz).strftime("%d/%m/%Y")
-    page_id, url = await create_schedule_page(title, schedule_to_blocks(schedule))
-    if not page_id:
-        await context.bot.send_message(
-            chat_id,
-            "יצירת הדף בנוטיון נכשלה. ודא ש-WEEKLY_SCHEDULES_PARENT נכון ושה-integration מחובר לדף."
-        )
-        return
-
-    context.user_data["draft_page_id"] = page_id
-    context.user_data["pending_inbox_ids"] = ids
-
-    if ids:
-        inbox_line = f"שובצו {len(ids)} משימות אינבוקס עם יום מפורש."
-    else:
-        inbox_line = "לא שובצו משימות אינבוקס אוטומטית — את החלונות הפתוחים תמלא לפי אנרגיה במהלך השבוע (פקודת /start)."
-    msg = f"הלוח מוכן 📅\n{url}\n\n{inbox_line}\nלאשר?"
-    if remaining:
-        msg += "\n\n⚠️ לא הצלחתי לתקן לבד:\n" + "\n".join("• " + v for v in remaining)
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ אשר", callback_data="approve_schedule"),
