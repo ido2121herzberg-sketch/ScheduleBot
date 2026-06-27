@@ -1522,6 +1522,18 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
         if not placed:
             unplaced.append(name)
 
+    # flexible events (no specific day): fill leftover free time AFTER routines — they beat open
+    # windows but never steal a routine's slot. Earliest working day first (early-week preference).
+    for ev in events:
+        if [d for d in (ev.get("days") or []) if d in DAY_ORDER]:
+            continue
+        fdur = ev.get("duration_min") or 60
+        for fday in week:
+            fslot = plans[fday].free_slot(DAY_START_MIN, BEDTIME_MIN, fdur)
+            if fslot is not None:
+                plans[fday].place(ev["name"], fslot, fslot + fdur)
+                break
+
     # 4. OPEN WINDOWS (>= 60 min gaps)
     for day, plan in plans.items():
         real = [x for x in plan.sorted_blocks() if not x.get("parallel")]
@@ -1613,16 +1625,32 @@ async def generate_and_post(chat_id, context):
 
     # Biweekly rotation: activate one member per rotation group this week; skip the rest.
     actives = select_rotation_actives(events, recurring_raw, week_index)
+    # a rotation item given a specific day+time stays a timed EVENT (honors the time, adds travel,
+    # uses its real length) instead of becoming a window-based routine.
+    rec_by_name = {r["name"]: r for r in recurring_raw}
+    pinned = set()
+    for e in events:
+        if e.get("time") and e.get("time") != "גמיש" and [d for d in (e.get("days") or []) if d in DAY_ORDER]:
+            for a in actives:
+                if a and a in (e.get("name") or ""):
+                    pinned.add(a)
+                    if not e.get("duration_min"):
+                        r = rec_by_name.get(a)
+                        if r:
+                            pt = r.get("preferred_time") or ""
+                            dmin = _parse_duration_he(pt)
+                            if not dmin:
+                                rng = _range_from(_split_travel(pt)[0])
+                                dmin = (rng[1] - rng[0]) if rng and rng[1] else 90
+                            e["duration_min"] = dmin
     recurring_for_build = []
     for r in recurring_raw:
         if r.get("frequency") == "פעם בשבועיים" and (r.get("rotation_group") or "").strip():
-            if r.get("name") in actives:
-                recurring_for_build.append({**r, "frequency": "שבועי"})  # run it this week
-            # else: another member of its group is active this week -> skip
+            if r.get("name") in actives and r.get("name") not in pinned:
+                recurring_for_build.append({**r, "frequency": "שבועי"})
         else:
             recurring_for_build.append(r)
-    # if the user named an active rotation item in exceptions, don't ALSO place it as an event
-    events = [e for e in events if not any(a and a in (e.get("name") or "") for a in actives)]
+    events = [e for e in events if not any(a and a in (e.get("name") or "") for a in (actives - pinned))]
 
     directives = context.user_data.get("parsed_directives", [])
     fixed_raw, recurring_for_build, dated_inbox, anchor, off_days, day_skips = apply_directives(
