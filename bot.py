@@ -1082,6 +1082,15 @@ def _name_out(name):
     return any(k in name for k in OUT_NAMES)
 
 
+def _dir_match(target, name):
+    """Does a deviation directive's target refer to this block? Every whitespace token of the
+    target (as Ido types it) must appear in the name; a single-word target is a substring test.
+    So 'תמיר' matches 'סשן עם תמיר מפיק', 'כושר' matches 'חדר כושר'."""
+    if not target or not name:
+        return False
+    return all(tok in name for tok in target.split())
+
+
 class DayPlan:
     def __init__(self, day):
         self.day = day
@@ -1233,8 +1242,70 @@ def _dated_inbox_timing(pt):
     return None, dur                # window / range / duration-based -> free slot
 
 
-def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST_DAY, anchor=None):
-    week = [d for d in DAY_ORDER if d != rest_day]  # placement happens on working days; the rest day is its own fixed routine
+def apply_directives(directives, fixed_raw, recurring, dated_inbox, anchor):
+    """STEP 2 deviation layer — applied per /schedule run, BEFORE classify_items. No DB writes.
+      off             -> day collected into off_days (no regular placements; events still allowed)
+      skip whole-week -> matching rows removed; if target is the anchor trigger, anchor turned off
+      skip day-scoped -> returned as day_skips; build_week guards that day (works for flexible gym)
+      move            -> matching rows re-pointed to the new day (recurring -> run once); moving the
+                         anchor trigger re-points the session row so build_week rebuilds the anchor
+                         day there and the old day normalizes."""
+    directives = directives or []
+    off_days = {d["day"] for d in directives if d["action"] == "off" and d["day"]}
+
+    anchor_day_now = None
+    if anchor and anchor.get("trigger"):
+        for r in recurring:
+            if _dir_match(anchor["trigger"], r.get("name", "")):
+                days = [d for d in (r.get("days") or []) if d in DAY_ORDER]
+                if days:
+                    anchor_day_now = days[0]
+
+    for d in directives:
+        if d["action"] != "move" or not d["day"] or not d["target"]:
+            continue
+        nd, tgt = d["day"], d["target"]
+        for r in recurring:
+            if _dir_match(tgt, r.get("name", "")):
+                r["days"] = [nd]
+                if r.get("frequency") != "פעם בשבועיים":
+                    r["frequency"] = "שבועי"
+        for fb in fixed_raw:
+            if _dir_match(tgt, fb.get("name", "")):
+                fb["days"] = [nd]
+        for it in dated_inbox:
+            if _dir_match(tgt, it.get("name", "")):
+                it["days"] = [nd]
+
+    def _whole(name):
+        return any(s["action"] == "skip" and not s["day"] and _dir_match(s["target"], name)
+                   for s in directives)
+
+    if anchor and anchor.get("trigger"):
+        for s in directives:
+            if s["action"] != "skip" or not _dir_match(s["target"], anchor["trigger"]):
+                continue
+            if not s["day"] or s["day"] == anchor_day_now:
+                anchor = None
+                break
+
+    fixed_raw = [fb for fb in fixed_raw if not _whole(fb.get("name", ""))]
+    recurring = [r for r in recurring if not _whole(r.get("name", ""))]
+    dated_inbox = [it for it in dated_inbox if not _whole(it.get("name", ""))]
+
+    day_skips = [{"target": s["target"], "day": s["day"]} for s in directives
+                 if s["action"] == "skip" and s["day"] and s["target"]]
+
+    return fixed_raw, recurring, dated_inbox, anchor, off_days, day_skips
+
+
+def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST_DAY, anchor=None, off_days=None, day_skips=None):
+    off_days = off_days or set()
+    day_skips = day_skips or []
+    def _dskip(name, day):
+        return any(_dir_match(s["target"], name) and s["day"] == day for s in day_skips)
+
+    week = [d for d in DAY_ORDER if d != rest_day and d not in off_days]  # placement happens on working days; the rest day is its own fixed routine
     plans = {d: DayPlan(d) for d in DAY_ORDER}
 
     # 1. EVENTS (highest; with travel buffer; can displace fixed)
@@ -1262,6 +1333,8 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
                 anchor_day = fb["days"][0] if fb["days"] else None
                 anchor_fb = fb
                 break
+    if anchor_day and (anchor_day in off_days or _dskip(anchor["trigger"], anchor_day)):
+        anchor_day, anchor_fb = None, None
     if anchor and anchor_day:
         s_start, s_end = anchor_fb["start"], anchor_fb["end"]
         dest = anchor.get("destination", "")
@@ -1286,7 +1359,9 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
         s, e = fb["start"], fb["end"]
         is_office = ("אופיס" in fb["name"]) or ("עבודה" in fb["name"])
         for day in fb["days"]:
-            if day not in plans:
+            if day not in plans or day in off_days:
+                continue
+            if _dskip(fb["name"], day):
                 continue
             if day == anchor_day and any(t in fb["name"] or fb["name"] in t for t in transit_names):
                 continue
@@ -1318,7 +1393,9 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
         pinned_start, dur = _dated_inbox_timing(pt)
         placed_any = False
         for day in it.get("days", []):
-            if day not in plans:
+            if day not in plans or day in off_days:
+                continue
+            if _dskip(name, day):
                 continue
             if any(b["name"] == name for b in plans[day].blocks):
                 placed_any = True  # already present on this day
@@ -1354,6 +1431,8 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
         target = _routine_days(r, anchor_day, rest_day)
         if freq == "יומי":
             for d in (target or routine_week):
+                if d in off_days or _dskip(r["name"], d):
+                    continue
                 occ.append((r, [d]))
         else:
             pool = target or routine_week
@@ -1374,6 +1453,8 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
 
         def try_place(window):
             for day in candidates:
+                if day in off_days or _dskip(name, day):
+                    continue
                 if any(b["name"] == name for b in plans[day].blocks):
                     used_days.setdefault(name, set()).add(day)
                     return True
@@ -1502,10 +1583,14 @@ async def generate_and_post(chat_id, context):
     # if the user named an active rotation item in exceptions, don't ALSO place it as an event
     events = [e for e in events if not any(a and a in (e.get("name") or "") for a in actives)]
 
+    directives = context.user_data.get("parsed_directives", [])
+    fixed_raw, recurring_for_build, dated_inbox, anchor, off_days, day_skips = apply_directives(
+        directives, fixed_raw, recurring_for_build, dated_inbox, anchor)
+
     fixed, routines = classify_items(fixed_raw, recurring_for_build)
     plans, unplaced, placed_inbox_ids = build_week(fixed, routines, events,
                                                    dated_inbox=dated_inbox, rest_day=rest_day,
-                                                   anchor=anchor)
+                                                   anchor=anchor, off_days=off_days, day_skips=day_skips)
     schedule = plans_to_schedule(plans)
 
     title = "לוז שבועי – " + datetime.now(israel_tz).strftime("%d/%m/%Y")
