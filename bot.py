@@ -1345,7 +1345,8 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
             start = _to_min(t) if t and t != "גמיש" else (plans[day].free_slot(18 * 60, BEDTIME_MIN, dur) or 18 * 60)
             end = min(start + dur, BEDTIME_MIN)
             event_travel.append((day, "נסיעה ל" + ev["name"], max(DAY_START_MIN, start - TRAVEL_BUFFER_MIN), start))
-            plans[day].place(ev["name"], start, end, out=True)
+            _is_office = any(k in ev["name"] for k in ("אופיס", "עבודה", "משרד"))
+            plans[day].place(ev["name"], start, end, out=True, span=_is_office)
 
     # ---- ANCHOR DAY: a weekly out-of-town anchor, configured via Settings (anchor_*).
     #      Builds the day around the anchor block: leave home -> travel out (with an optional
