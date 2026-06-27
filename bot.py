@@ -1327,6 +1327,7 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
     #      evening activity substitute a routine (see gym_drop). anchor is None / trigger blank
     #      -> no anchor day (feature off; nothing Ido-specific remains in the code).
     anchor_day, anchor_fb = None, None
+    anchor_eve = None
     if anchor and anchor.get("trigger"):
         for fb in fixed:
             if anchor["trigger"] in fb["name"]:
@@ -1347,7 +1348,7 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
         if anchor.get("transit_back"):
             plans[anchor_day].place(anchor["transit_back"], s_end, s_end + tmin, parallel=True, out=True)
         if anchor.get("evening"):
-            plans[anchor_day].place(anchor["evening"], s_end + ret, s_end + ret + eve_min, out=True)
+            anchor_eve = (anchor_day, anchor["evening"], s_end + ret, eve_min)  # placed after FIXED so it can yield
     transit_names = [t for t in (anchor.get("transit_out"), anchor.get("transit_back"))
                      if t] if anchor else []
 
@@ -1373,6 +1374,17 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
                 plans[day].place(fb["name"], s, e, energy=fb.get("energy", ""), out=True, span=True)
             elif not plans[day].occupied(s, e):
                 plans[day].place(fb["name"], s, e, energy=fb.get("energy", ""), out=_loc_out(fb.get("location", "")))
+
+    # anchor evening: natural time if free, else slide later in the evening, else yield (don't
+    # bulldoze a fixed evening commitment when the anchor was moved onto an already-busy day)
+    if anchor_eve:
+        aday, enm, estart, emin = anchor_eve
+        if not plans[aday].occupied(estart, estart + emin):
+            plans[aday].place(enm, estart, estart + emin, out=True)
+        else:
+            slot = plans[aday].free_slot(estart, BEDTIME_MIN, emin, need_home=False)
+            if slot is not None:
+                plans[aday].place(enm, slot, slot + emin, out=True)
 
     # 2.5 DATED INBOX (Stage 3): one-time tasks with an explicit day, placed like priority-2.
     #     Travel buffer only if the task is out-of-home. Inbox tasks have no מיקום property yet,
