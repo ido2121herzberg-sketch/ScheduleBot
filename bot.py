@@ -209,6 +209,19 @@ async def get_recurring_tasks():
     return tasks
 
 
+async def get_activity_names():
+    """The user's real activity names (fixed blocks + routines) so the parser can resolve a vague
+    word like 'סשן' to the exact routine the user means."""
+    names = set()
+    for f in (await get_fixed_blocks()):
+        if f.get("name"):
+            names.add(f["name"])
+    for r in (await get_recurring_tasks_full()):
+        if r.get("name"):
+            names.add(r["name"])
+    return sorted(names)
+
+
 async def get_inbox_tasks_full():
     data = await get_notion_data(TASK_INBOX_DB, {
         "filter": {"property": "סטטוס", "select": {"equals": "אינבוקס"}}
@@ -377,7 +390,12 @@ def normalize_directives(raw):
     return out
 
 
-def parse_exceptions(text):
+def parse_exceptions(text, activities=None):
+    activity_list = "\n".join("- " + a for a in (activities or []))
+    activity_block = ("\n\nרשימת הפעילויות הקבועות של המשתמש (השמות המדויקים):\n" + activity_list +
+        "\nכשאתה ממלא target ב-directive, העתק שם מדויק מהרשימה הזו (מילה במילה) לפי ההקשר. "
+        "למשל 'סשן' לבד = 'סשן עם תמיר מפיק' (ולא 'סשן מסחר יורו' שהוא המסחר). "
+        "אם שום פעילות ברשימה לא מתאימה למה שהמשתמש ביקש — אל תיצור directive.") if activities else ""
     prompt = f"""אתה מנתח קלט לעוזר אישי. עידו כותב בעברית חופשית את החריגים שלו לשבוע הקרוב.
 החזר JSON אחד עם שני שדות: "events" (דברים להוסיף) ו-"directives" (לבטל / להזיז / חופש).
 אתה רק מסווג ומחלץ — אתה לא קובע שעות ולא בונה לוז.
@@ -389,14 +407,14 @@ events — אירוע חד-פעמי חדש (חתונה, פגישה, ערב בפ�
 - time: HH:MM או "גמיש"; עגל ל-:00/:30; לעולם לא 23:59.
 
 directives — שינוי על השגרה הקיימת:
-- "skip": ביטול קיים. "בלי תמיר השבוע" → {{"action":"skip","target":"תמיר","day":null}};
-  "בלי כושר ברביעי" → {{"action":"skip","target":"כושר","day":"רביעי"}}.
-- "move": העברה ליום אחר. "תמיר ביום שלישי" → {{"action":"move","target":"תמיר","day":"שלישי"}}.
+- "skip": ביטול קיים. target = השם המדויק מהרשימה. "בלי תמיר השבוע" → {{"action":"skip","target":"סשן עם תמיר מפיק","day":null}};
+  "בלי כושר ברביעי" → {{"action":"skip","target":"חדר כושר","day":"רביעי"}}.
+- "move": העברה ליום אחר (target = השם המדויק). "תמיר ביום שלישי" → {{"action":"move","target":"סשן עם תמיר מפיק","day":"שלישי"}}.
 - "off": יום חופש מלא. "חופש ביום ראשון" → {{"action":"off","target":null,"day":"ראשון"}};
   טווח "חופש ראשון עד רביעי" → רשומת off נפרדת לכל יום.
 כללים: target = שם כפי שעידו מתייחס אליו, בלי תרגום (ב-off → null). day = יום עברי או null.
 תוספת → events; ביטול/העברה/חופש → directives; אל תכפיל לשני השדות. אין מסוג מסוים → רשימה ריקה.
-החזר אך ורק JSON: {{"events":[...], "directives":[...]}}. בלי טקסט נוסף, בלי markdown.
+החזר אך ורק JSON: {{"events":[...], "directives":[...]}}. בלי טקסט נוסף, בלי markdown.{activity_block}
 
 הקלט:
 {text}"""
@@ -1254,9 +1272,11 @@ def apply_directives(directives, fixed_raw, recurring, dated_inbox, anchor):
     off_days = {d["day"] for d in directives if d["action"] == "off" and d["day"]}
 
     anchor_day_now = None
+    anchor_names = [anchor["trigger"]] if anchor and anchor.get("trigger") else []
     if anchor and anchor.get("trigger"):
         for r in recurring:
             if _dir_match(anchor["trigger"], r.get("name", "")):
+                anchor_names.append(r["name"])
                 days = [d for d in (r.get("days") or []) if d in DAY_ORDER]
                 if days:
                     anchor_day_now = days[0]
@@ -1283,7 +1303,9 @@ def apply_directives(directives, fixed_raw, recurring, dated_inbox, anchor):
 
     if anchor and anchor.get("trigger"):
         for s in directives:
-            if s["action"] != "skip" or not _dir_match(s["target"], anchor["trigger"]):
+            if s["action"] != "skip":
+                continue
+            if not any(_dir_match(s["target"], nm) for nm in anchor_names):
                 continue
             if not s["day"] or s["day"] == anchor_day_now:
                 anchor = None
@@ -1309,6 +1331,7 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
     plans = {d: DayPlan(d) for d in DAY_ORDER}
 
     # 1. EVENTS (highest; with travel buffer; can displace fixed)
+    event_travel = []  # event pre-travel is deferred to after FIXED so it can't evict a job
     for ev in events:
         dur = ev.get("duration_min") or 240
         for day in ev.get("days", []):
@@ -1317,7 +1340,7 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
             t = ev.get("time")
             start = _to_min(t) if t and t != "גמיש" else (plans[day].free_slot(18 * 60, BEDTIME_MIN, dur) or 18 * 60)
             end = min(start + dur, BEDTIME_MIN)
-            plans[day].place("נסיעה ל" + ev["name"], max(DAY_START_MIN, start - TRAVEL_BUFFER_MIN), start, out=True)
+            event_travel.append((day, "נסיעה ל" + ev["name"], max(DAY_START_MIN, start - TRAVEL_BUFFER_MIN), start))
             plans[day].place(ev["name"], start, end, out=True)
 
     # ---- ANCHOR DAY: a weekly out-of-town anchor, configured via Settings (anchor_*).
@@ -1334,7 +1357,8 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
                 anchor_day = fb["days"][0] if fb["days"] else None
                 anchor_fb = fb
                 break
-    if anchor_day and (anchor_day in off_days or _dskip(anchor["trigger"], anchor_day)):
+    if anchor_day and (anchor_day in off_days or _dskip(anchor["trigger"], anchor_day)
+                       or (anchor_fb and _dskip(anchor_fb["name"], anchor_day))):
         anchor_day, anchor_fb = None, None
     if anchor and anchor_day:
         s_start, s_end = anchor_fb["start"], anchor_fb["end"]
@@ -1374,6 +1398,11 @@ def build_week(fixed, recurring, events, dated_inbox=None, rest_day=DEFAULT_REST
                 plans[day].place(fb["name"], s, e, energy=fb.get("energy", ""), out=True, span=True)
             elif not plans[day].occupied(s, e):
                 plans[day].place(fb["name"], s, e, energy=fb.get("energy", ""), out=_loc_out(fb.get("location", "")))
+
+    # deferred event travel: place each only where free, so a travel buffer never evicts a job
+    for _d, _nm, _ts, _te in event_travel:
+        if _te > _ts and not plans[_d].occupied(_ts, _te):
+            plans[_d].place(_nm, _ts, _te, out=True)
 
     # anchor evening: natural time if free, else slide later in the evening, else yield (don't
     # bulldoze a fixed evening commitment when the anchor was moved onto an already-busy day)
@@ -1660,7 +1689,8 @@ async def schedule_exceptions_received(update: Update, context: ContextTypes.DEF
     await update.message.reply_text("רגע, מנתח את מה שכתבת...")
     context.user_data["exceptions_text"] = text
     try:
-        parsed = await asyncio.to_thread(parse_exceptions, text)
+        activities = await get_activity_names()
+        parsed = await asyncio.to_thread(parse_exceptions, text, activities)
     except Exception as e:
         print(f"parse error: {e}")
         parsed = {"events": [{"name": text, "days": [], "time": "גמיש", "recurring": False,
@@ -1688,7 +1718,8 @@ async def schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_text = (base_text + "\n\nהבהרה/תיקון נוסף מהמשתמש: " + text).strip()
     failed = False
     try:
-        parsed = await asyncio.to_thread(parse_exceptions, full_text)
+        activities = await get_activity_names()
+        parsed = await asyncio.to_thread(parse_exceptions, full_text, activities)
         events = parsed["events"]
         directives = parsed["directives"]
         if not events and not directives:
