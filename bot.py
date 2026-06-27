@@ -14,12 +14,20 @@ from telegram.ext import (
 # Configuration
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
+MASTER_NOTION_TOKEN = NOTION_TOKEN  # never reassigned; used to read the Users table
+USERS_DB = "2c0191a234fd48018fa729e240d36249"  # משתמשים (Users)
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 RECURRING_TASKS_DB = "367464c26f0980bfa319c778167a19a3"
 TASK_INBOX_DB = "367464c26f0980ed89b0ca6831f4b27e"
 WEEKLY_SCHEDULES_PARENT = "378464c26f098051ba48e8f539d92328"
 FIXED_BLOCKS_DB = "ca022797f1844cb79c76be05fae5e073"  # בלוקים קבועים
 SETTINGS_DB = "fde6e26e6af3407b82dc1656214dd551"  # הגדרות (Settings) — per-user knobs, key/value
+DEFAULT_NOTION_TOKEN = NOTION_TOKEN
+DEFAULT_RECURRING_TASKS_DB = RECURRING_TASKS_DB
+DEFAULT_TASK_INBOX_DB = TASK_INBOX_DB
+DEFAULT_WEEKLY_SCHEDULES_PARENT = WEEKLY_SCHEDULES_PARENT
+DEFAULT_FIXED_BLOCKS_DB = FIXED_BLOCKS_DB
+DEFAULT_SETTINGS_DB = SETTINGS_DB
 
 # Notion API version. 2022-06-28 (legacy) queries /v1/databases/{id}/query and is BLIND to rows
 # created via the newer data-source API — that was the "journal renders nowhere" bug. 2025-09-03
@@ -309,6 +317,60 @@ async def get_settings():
             continue
         out[key.strip()] = (_rtext(props, "ערך") or "").strip()
     return out
+
+
+def _users_row_to_cfg(page):
+    props = page["properties"]
+    return {
+        "telegram_id": _rtext(props, "telegram_id"),
+        "notion_token": _rtext(props, "notion_token"),
+        "recurring_db": _rtext(props, "recurring_db"),
+        "fixed_db": _rtext(props, "fixed_db"),
+        "inbox_db": _rtext(props, "inbox_db"),
+        "settings_db": _rtext(props, "settings_db"),
+        "schedules_parent": _rtext(props, "schedules_parent"),
+        "active": bool(props.get("פעיל", {}).get("checkbox", False)),
+    }
+
+async def get_user_cfg(uid):
+    data = await get_notion_data(USERS_DB, {
+        "filter": {"property": "telegram_id", "rich_text": {"equals": str(uid)}}
+    })
+    if not data or "results" not in data:
+        return None
+    match = next((r for r in data["results"]
+                  if _users_row_to_cfg(r)["telegram_id"] == str(uid)), None)
+    if not match:
+        return "DENY"
+    cfg = _users_row_to_cfg(match)
+    return cfg if cfg["active"] else "DENY"
+
+def apply_user_config(cfg):
+    global NOTION_TOKEN, RECURRING_TASKS_DB, TASK_INBOX_DB, FIXED_BLOCKS_DB, SETTINGS_DB, WEEKLY_SCHEDULES_PARENT
+    if not cfg:
+        NOTION_TOKEN = DEFAULT_NOTION_TOKEN
+        RECURRING_TASKS_DB = DEFAULT_RECURRING_TASKS_DB
+        TASK_INBOX_DB = DEFAULT_TASK_INBOX_DB
+        FIXED_BLOCKS_DB = DEFAULT_FIXED_BLOCKS_DB
+        SETTINGS_DB = DEFAULT_SETTINGS_DB
+        WEEKLY_SCHEDULES_PARENT = DEFAULT_WEEKLY_SCHEDULES_PARENT
+        return
+    NOTION_TOKEN = cfg["notion_token"] or DEFAULT_NOTION_TOKEN
+    RECURRING_TASKS_DB = cfg["recurring_db"] or DEFAULT_RECURRING_TASKS_DB
+    TASK_INBOX_DB = cfg["inbox_db"] or DEFAULT_TASK_INBOX_DB
+    FIXED_BLOCKS_DB = cfg["fixed_db"] or DEFAULT_FIXED_BLOCKS_DB
+    SETTINGS_DB = cfg["settings_db"] or DEFAULT_SETTINGS_DB
+    WEEKLY_SCHEDULES_PARENT = cfg["schedules_parent"] or DEFAULT_WEEKLY_SCHEDULES_PARENT
+
+async def gate(update, context):
+    apply_user_config(None)
+    uid = update.effective_user.id if update and update.effective_user else None
+    cfg = await get_user_cfg(uid) if uid is not None else None
+    if cfg == "DENY":
+        return False
+    context.user_data["cfg"] = cfg if cfg else None
+    apply_user_config(context.user_data["cfg"])
+    return True
 
 
 def _settings_min(settings, key, default_min):
@@ -1576,6 +1638,7 @@ def plans_to_schedule(plans):
 # ===================== ORCHESTRATION =====================
 
 async def generate_and_post(chat_id, context):
+    apply_user_config(context.user_data.get("cfg"))
     events = context.user_data.get("parsed_events", [])
 
     prev = context.user_data.get("draft_page_id")
@@ -1701,6 +1764,9 @@ async def generate_and_post(chat_id, context):
 # ===================== SCHEDULE CONVERSATION =====================
 
 async def schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await gate(update, context):
+        await update.message.reply_text("אין לך גישה לבוט. דבר עם עידו כדי להתחבר.")
+        return ConversationHandler.END
     await update.message.reply_text(
         "בוא נבנה את הלוז לשבוע הבא 📅\n"
         "כתוב לי את החריגים של השבוע — אירועים חד-פעמיים, שינויים, ומה פעיל השבוע "
@@ -1792,6 +1858,9 @@ async def schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_schedule_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not await gate(update, context):
+        await query.answer("אין לך גישה לבוט.", show_alert=True)
+        return
     await query.answer()
     if query.data == "approve_schedule":
         ids = context.user_data.get("pending_inbox_ids", [])
@@ -1893,6 +1962,9 @@ def match_mood_pool(pool, chosen_energy, available_min):
 # ===================== EXISTING FEATURES =====================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await gate(update, context):
+        await update.message.reply_text("אין לך גישה לבוט. דבר עם עידו כדי להתחבר.")
+        return ConversationHandler.END
     keyboard = [["🟢 אנרגיה גבוהה", "🟡 אנרגיה בינונית", "🔴 אנרגיה נמוכה"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text("היי עידו! 👋\nמה מצב האנרגיה שלך עכשיו?", reply_markup=reply_markup)
@@ -1917,6 +1989,7 @@ async def handle_energy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    apply_user_config(context.user_data.get("cfg"))
     mins = parse_time_choice(update.message.text)
     if mins is None:
         await update.message.reply_text("תבחר זמן מהכפתורים 🙂")
@@ -1947,6 +2020,9 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await gate(update, context):
+        await update.message.reply_text("אין לך גישה לבוט. דבר עם עידו כדי להתחבר.")
+        return
     tasks = await get_inbox_tasks()
     if not tasks:
         await update.message.reply_text("האינבוקס שלך ריק 🎉")
